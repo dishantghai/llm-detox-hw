@@ -168,14 +168,24 @@ def train(
             pol_out = policy(input_ids=ids, attention_mask=attn)
             with torch.no_grad():
                 ref_out = reference(input_ids=ids, attention_mask=attn)
-            pol_logps = per_example_logps(pol_out.logits, labels)
-            ref_logps = per_example_logps(ref_out.logits, labels)
-            pol_chosen, pol_rej = pol_logps[0::2], pol_logps[1::2]
-            ref_chosen, ref_rej = ref_logps[0::2], ref_logps[1::2]
-            losses, chosen_r, rejected_r = dpo_loss(
-                pol_chosen, pol_rej, ref_chosen, ref_rej, beta=beta,
+            # ===== TASK 2 (part 2) — wire your dpo_loss into the trainer =====
+            #
+            # The collator interleaves preference pairs so even rows are
+            # chosen and odd rows are rejected. Using the provided helper
+            # ``per_example_logps(logits, labels)``, compute per-example
+            # log-probs for the policy and the reference, slice each
+            # resulting ``(batch,)`` tensor into chosen/rejected halves,
+            # call your ``dpo_loss``, and set ``loss = losses.mean()``.
+            #
+            # Names the rest of this loop expects after the block:
+            #   - ``loss``      — scalar tensor, fed into ``.backward()`` below
+            #   - ``chosen_r``  — shape ``(batch/2,)``, for the log line further down
+            #   - ``rejected_r``— shape ``(batch/2,)``, same
+            # <YOUR CODE HERE>
+            raise NotImplementedError(
+                "Task 2 (part 2): wire dpo_loss into the trainer"
             )
-            loss = losses.mean()
+            # ==================================================================
             (loss / grad_accum).backward()
             micro += 1
             if micro % grad_accum == 0:
