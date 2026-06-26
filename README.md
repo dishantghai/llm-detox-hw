@@ -1,4 +1,4 @@
-# LLM Post-training Homework — detox direction
+# LLM Post-training Homework, Option B: LLM Detox
 
 You will push `Qwen/Qwen2.5-0.5B` (the **non-Instruct** variant) away
 from hostile completions on three held-out prompt families, using SFT
