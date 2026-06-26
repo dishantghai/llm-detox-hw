@@ -43,7 +43,8 @@ adapters/checkpoints:
 
 You need:
 
-- A Linux VM with one H100 (or comparable) and **docker** installed.
+- A GPU. This hometask is tested on H100. It should likely work on A100. There's no guarantee it works on L40s. The model is rather small, so the issues, if you encounter them, will unlikely be because of OOM. They will rather be caused by quirks of `verl`.
+- **docker** installed.
 - The `nvidia-container-toolkit` so docker sees the GPU. Verify with
   `sudo docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi`.
 
