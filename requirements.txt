@@ -6,3 +6,5 @@ detoxify>=0.5
 torchao>=0.16
 scikit-learn
 tqdm
+pandas>=2.0
+matplotlib>=3.7
