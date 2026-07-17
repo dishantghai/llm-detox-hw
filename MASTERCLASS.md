@@ -269,6 +269,13 @@ prompt via the already-provided `sample_k`, score them with
 `(support_rate contribution, max, std)`, then average those three
 over the slice.
 
+> **Edit `src/detox_hw/eval_lib.py`.** Find the `# TASK 1 —
+> sampled_eval` banner comment (~line 243) and the `sampled_eval`
+> stub right below it. Delete its two-line body —
+> `# <YOUR CODE HERE>` followed by `raise NotImplementedError(...)`
+> (lines 280–281) — and replace it with the body below, keeping the
+> `def sampled_eval(...)` signature that's already in the file:
+
 ```python
 def sampled_eval(
     model,
@@ -307,7 +314,12 @@ theoretically clean choice.
 #### `greedy_eval` — Task 3 [10 pts]
 
 Simpler than `sampled_eval` — one completion per prompt, no sampling
-diagnostics:
+diagnostics.
+
+> **Edit `src/detox_hw/eval_lib.py`.** Same file, further down: the
+> `# TASK 3 — greedy_eval` banner (~line 285) and its stub. Replace
+> the `# <YOUR CODE HERE>` / `raise NotImplementedError(...)` body
+> (lines 308–309) with:
 
 ```python
 def greedy_eval(
@@ -323,6 +335,11 @@ def greedy_eval(
 ```
 
 #### `worst_of_k_eyeball` — Task 6 [10 pts]
+
+> **Edit `src/detox_hw/eval_lib.py`.** Same file, last of the three:
+> the `# TASK 6 — worst_of_k_eyeball` banner (~line 313) and its stub.
+> Replace the `# <YOUR CODE HERE>` / `raise NotImplementedError(...)`
+> body (lines 342–343) with:
 
 ```python
 def worst_of_k_eyeball(
@@ -361,12 +378,24 @@ The README's walkthrough starts evaluating at the SFT checkpoint. Before
 you do that, take one more reading: **the raw, untrained base model.**
 Without this you can't actually claim "SFT helped" — you'd be
 comparing SFT to your prior belief about the base model instead of a
-measured number. This is the standard control-group instinct, and —
-now that §3.2 is done — it costs four lines to actually run:
+measured number. This is the standard control-group instinct.
+
+Unlike §3.2's three functions, nothing here gets pasted into the repo
+— there's no stub, no marker, no grading tied to it. This is a
+throwaway script: save it as, say, `scratch_baseline.py` at the repo
+root (venv active, same directory `data_prep.build_pairs` ran from),
+or paste it cell-by-cell into a Python REPL / Jupyter kernel. Either
+way, run it, read the two printouts, and keep the numbers — the file
+itself is disposable.
+
+#### Load the base model
+
+This is the first point in the entire walkthrough that any model gets
+loaded at all — §3.1 only ran Detoxify over text, §3.2 only edited
+`eval_lib.py` without executing it.
 
 ```python
 # run from repo root, venv active
-from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM
 from src.detox_hw.eval_lib import (
@@ -376,7 +405,17 @@ from src.detox_hw.eval_lib import (
 base = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_NAME, dtype=torch.float32, device_map="cuda"
 ).eval()
+```
 
+`BASE_MODEL_NAME` resolves to `Qwen/Qwen2.5-0.5B` — public and
+non-gated, so `from_pretrained` downloads it straight to
+`~/.cache/huggingface` on this first call with no HF login or token
+needed, then loads it onto the VM's single GPU. Subsequent loads
+(SFT, DPO, PPO evals) reuse that same cache and are fast.
+
+#### Run the two evals
+
+```python
 slices = {k: EVAL_SLICES[k] for k in
           ("mild_prefix", "direct_provocation", "rtp_challenging")}
 
@@ -511,6 +550,11 @@ of drifting off-distribution.
 
 ### 5.2 Task 2 — implement `dpo_loss` [15 pts]
 
+> **Edit `tasks/task2_dpo_loss.py`.** The whole file is one function —
+> replace the `# <YOUR CODE HERE>` / `raise NotImplementedError(...)`
+> body (lines 64–65) inside `dpo_loss`, below its docstring. Keep the
+> `def dpo_loss(...)` signature already in the file:
+
 ```python
 def dpo_loss(
     policy_chosen_logps: torch.Tensor,
@@ -558,6 +602,14 @@ python -m tasks.task2_dpo_loss   # → "dpo_loss: all checks passed"
 ```
 
 ### 5.3 Wiring `dpo_loss` into the trainer
+
+> **Edit `src/detox_hw/train_dpo.py`.** Inside the training loop,
+> find the block bounded by the `# ===== TASK 2 (part 2) =====` /
+> `# ====...====` comment banners (~lines 171–188). It sits right
+> after `pol_out`/`ref_out` are computed and right before
+> `(loss / grad_accum).backward()`. Replace the `# <YOUR CODE HERE>`
+> / `raise NotImplementedError(...)` lines (184–187) in between —
+> nothing else in the loop needs to change.
 
 `train_dpo.py` already computes forward passes for both policy and
 reference; the marked block needs per-example log-probs, split into
@@ -680,6 +732,10 @@ Two implementation details matter more than the loss itself:
 
 ### 6.2 Task 4 — implement `bt_loss` [10 pts]
 
+> **Edit `tasks/task4_bt_loss.py`.** Replace the `# <YOUR CODE HERE>`
+> / `raise NotImplementedError(...)` body (lines 35–36) inside
+> `bt_loss`, below its docstring:
+
 ```python
 def bt_loss(
     chosen_scores: torch.Tensor,
@@ -699,6 +755,12 @@ python -m tasks.task4_bt_loss   # → "bt_loss: all checks passed"
 ```
 
 ### 6.3 Task 5 — `build_rm` + `rm_step` [20 pts]
+
+> **Edit `tasks/task5_reward_head.py`.** Two stubs in this one file:
+> replace the `# <YOUR CODE HERE>` / `raise NotImplementedError(...)`
+> body of `build_rm` (lines 65–66, below its docstring) and, further
+> down, the same pair inside `rm_step` (lines 95–96). Both go in the
+> same file — no need to touch anything else:
 
 ```python
 def build_rm(
@@ -1032,6 +1094,17 @@ signal instead of rewarding it without bound, penalize the two
 cheapest collapse symptoms directly (repetition, always-hitting-the
 length cap), and tie the score back to the prompt so a prompt-independent
 template stops being free:
+
+> **Edit `tasks/task8_custom_reward.py`.** Unlike the earlier tasks,
+> this one replaces the **whole file**, not just the body inside a
+> marker — the stub only has `reward_score`'s `# <YOUR CODE HERE>`
+> (line 68) to fill in, but a real design needs module-level helpers
+> (`_get_detox`, `_trigram_repeat_penalty`, etc.) that don't exist in
+> the stub yet, so they have to go in above `reward_score`, not inside
+> it. The block below is the complete file, imports through the final
+> `reward_score.prompt_conditioned = True` line — overwrite the stub
+> with all of it, keeping the module path unchanged so
+> `TOXIC_REWARD=custom:tasks.task8_custom_reward` still resolves.
 
 ```python
 from __future__ import annotations
