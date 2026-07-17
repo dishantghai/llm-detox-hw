@@ -3,13 +3,15 @@
 This is a working guide, not a script. It's written the way a data
 scientist actually moves through a project: state what you believe
 before you run anything, run the smallest experiment that tests it,
-read the instrument, and only then decide the next step. The
-homework (`README.md` in this repo) gives you the *what* — the four
-checkpoints, the eight tasks, the exact commands. This document gives
-you the *why*, tied line-for-line to the RL/LLM theory series you
-just finished (`ai-for-commons/rl-series`, Posts 1–15), plus full
-reference implementations for every task with the reasoning behind
-each line.
+read the instrument, and only then decide the next step. Everything
+you need to provision the VM, write every task, train all four
+checkpoints, and produce every submission file is in this one
+document, in the order you should actually do it — tied line-for-line
+to the RL/LLM theory series you just finished (`ai-for-commons/rl-series`,
+Posts 1–15), with full reference implementations and the reasoning
+behind each line. `README.md` in this repo is the grading rubric (task
+list, point values, submission format) — useful to check your score
+against, not required reading to follow along here.
 
 **How to use this doc.** Type the code yourself first if you want the
 theory to stick — the reference solutions here are for after you've
@@ -122,6 +124,14 @@ Container Toolkit yourself (§1.4).
 
 ### 1.3 Launch the instance and SSH in
 
+The `#cloud-config` block below is **cloud-init** user-data — a
+standard mechanism most cloud providers (Nebius included) run on first
+boot to configure a fresh VM from a small YAML/script blob, before you
+ever SSH in. Here it does one job: create the `user` account, grant it
+passwordless `sudo`, and install your public key so `ssh user@$VM_IP`
+works the moment the instance is up — the base image otherwise has no
+login for you.
+
 ```bash
 export USER_DATA=$(jq -Rrs '.' <<EOF
 #cloud-config
@@ -174,7 +184,7 @@ sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 
-# The exact check the homework README asks for:
+# GPU access check — must print the GPU table before you move on to §7 (verl):
 sudo docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 ```
 
@@ -223,6 +233,19 @@ assignment, which flips the polarity — same pipeline, opposite
 optimization target. Everything you build here pushes *away* from
 `rejected`.)
 
+**What's Detoxify, concretely.** It's `unitary/toxic-bert` wrapped by
+the `detoxify` pip package — a BERT-family classifier fine-tuned on
+Jigsaw's toxic-comment data. Call `Detoxify("original").predict(text)`
+and you get six scores back, each in `[0, 1]`: `toxicity`,
+`severe_toxicity`, `obscene`, `threat`, `insult`, `identity_attack`.
+This whole homework reads only the `toxicity` head (`detoxify_score`
+in `src/detox_hw/eval_lib.py` extracts exactly that field) — it's the
+one proxy metric every stage (filtering, eval, and later the PPO
+reward in §7) is judged against, so its blind spots are the
+homework's blind spots too: it scores surface toxicity of the text
+alone, with no notion of whether a hostile-sounding response was
+actually the *appropriate* thing to say to a hostile prompt.
+
 The Detoxify thresholds (`chosen ≤ 0.10`, `rejected ≥ 0.50`) exist for
 one reason: **DPO and the RM both learn from the *difference* between
 two completions.** If both sides of a pair are mildly-and-similarly
@@ -231,17 +254,25 @@ points. Tightening the filter is buying signal quality at the cost of
 data volume — ~80k rows in, ~2.5k pairs out. That's a real trade a
 data scientist makes deliberately, not an accident of the filter.
 
-### 3.2 Implement the eval scaffolding now — Tasks 1, 3, and 6 together
+### 3.2 Implement the eval scaffolding now — all three functions, one sitting
 
-The README stages these three `eval_lib.py` functions as separate,
-later tasks — `sampled_eval` under SFT (Task 1, graded in §4.1),
-`greedy_eval` under DPO (Task 3, graded in §5.4), `worst_of_k_eyeball`
-under PPO (Task 6, graded in §7.3) — tied to the stage where each
-number first becomes interesting to *read*. But look at what the eval
-scripts actually import. `tasks/task1_sft_eval.py`,
-`task3_dpo_eval.py`, `task6_ppo_detoxify_eval.py`, and
-`task7_ppo_rm_eval.py` — all four — call **all three** helpers every
-time:
+`src/detox_hw/eval_lib.py` holds three stub functions —
+`sampled_eval`, `greedy_eval`, `worst_of_k_eyeball` — and each is
+graded at a different checkpoint, because each number becomes
+interesting to *read* at a different point in training:
+
+| Function | Graded at | Where | Points |
+|---|---|---|---|
+| `sampled_eval` | SFT checkpoint | §4.1 | 15 |
+| `greedy_eval` | DPO checkpoint | §5.4 | 10 |
+| `worst_of_k_eyeball` | PPO checkpoint | §7.3 | 10 |
+
+That per-checkpoint grading might suggest you can implement them one
+at a time, as you reach each stage. You can't. Every per-checkpoint
+eval script — `tasks/task1_sft_eval.py`, `task3_dpo_eval.py`,
+`task6_ppo_detoxify_eval.py`, `task7_ppo_rm_eval.py` — imports and
+calls **all three** helpers on every run, regardless of which one its
+own grading is about:
 
 ```python
 greedy  = greedy_eval(model, slices)
@@ -249,16 +280,17 @@ sampled = sampled_eval(model, slices, k=a.k)
 eyeball = worst_of_k_eyeball(model, slices["mild_prefix"], k=a.k)
 ```
 
-Run `task1_sft_eval.py` with only `sampled_eval` filled in and it
-crashes on the `greedy_eval` call — `NotImplementedError: Task 3:
-implement greedy_eval` — before it ever reaches the function you
-actually came to test. The dependency graph is flat, not staged: all
-three need to exist before you can run *any* per-checkpoint eval,
-including the control baseline two sections from now (§3.3) and the
-very first real one (§4.1, right after SFT training). The point
-values and the "which stage does this number become interesting"
-framing stay exactly as the README lays them out — only the *typing
-it in* moves earlier. Implement all three now.
+So if you leave `greedy_eval` and `worst_of_k_eyeball` as stubs and
+only fill in `sampled_eval`, running `task1_sft_eval.py` doesn't get
+you a `sampled_eval` reading — it crashes on the very next line,
+`NotImplementedError: Task 3: implement greedy_eval`, before it ever
+reaches the function you came to test. The dependency graph across
+these three is flat, not staged: all three have to exist before you
+can run *any* per-checkpoint eval at all, including the control
+baseline two sections from now (§3.3) and the first real one (§4.1,
+right after SFT training). The grading — which points attach to which
+checkpoint — doesn't change; only the order you type the code in
+does. Implement all three now, in this one sitting.
 
 #### `sampled_eval` — Task 1 [15 pts]
 
@@ -374,8 +406,9 @@ real generation. The first real check is the control baseline next.
 
 ### 3.3 Establish a control measurement — before any training
 
-The README's walkthrough starts evaluating at the SFT checkpoint. Before
-you do that, take one more reading: **the raw, untrained base model.**
+The walkthrough ahead starts evaluating at the SFT checkpoint (§4.1).
+Before you get there, take one more reading now: **the raw, untrained
+base model.**
 Without this you can't actually claim "SFT helped" — you'd be
 comparing SFT to your prior belief about the base model instead of a
 measured number. This is the standard control-group instinct.
@@ -449,6 +482,25 @@ on reproducing its own system prompt. That's Post 2's
 `pθ(y|x) = ∏ₜ pθ(yₜ|x,y<ₜ)` factorization and its log-sum loss,
 applied with a label mask — no new theory, just the mechanical
 foundation the RL series built its first two posts on top of.
+
+**A tooling note that applies to every stage from here on: this
+homework trains with LoRA, not full fine-tuning.** `train_sft.py`
+(and `train_dpo.py`, `train_rm.py`, and PPO's actor/critic in §7)
+wrap Qwen2.5-0.5B with `peft`'s `LoraConfig` instead of updating every
+weight. Concretely: each targeted linear layer's frozen weight matrix
+`W` gets a parallel low-rank pair `A` (`r × d`) and `B` (`d × r`), and
+the forward pass computes `Wx + BAx` — training only updates `A`/`B`
+(a few million params) while `W` sits frozen. `r` (rank, e.g. `16`)
+sets how much capacity that side-path has; `alpha` scales its
+contribution relative to `W`. This is why checkpoints are called
+"adapters" and stay tiny (megabytes, not gigabytes) — you're saving
+`A`/`B`, not the base model — and why §1.2 sized the boot disk
+assuming small LoRA deltas per stage plus the base model's cache
+copy, not four full duplicate copies of Qwen2.5-0.5B. None of this
+homework's tasks ask you to configure LoRA yourselves except Task 5
+(§6.3, the RM's `build_rm`) — everywhere else it's already wired up
+in the provided trainer — but "LoRA target modules," "adapter," and
+"delta" all refer to this same mechanism whenever they come up later.
 
 ### 4.1 Task 1 — `sampled_eval` [15 pts]
 
@@ -531,8 +583,7 @@ run a single rollout. What's left is the **DPO loss**:
 L_DPO = -log σ( β · [ log(π(y⁺|x)/π_ref(y⁺|x)) − log(π(y⁻|x)/π_ref(y⁻|x)) ] )
 ```
 
-— exactly the formula in `README.md` §Step 4 and in
-`tasks/task2_dpo_loss.py`'s docstring, with `π ↔ pθ` and
+— exactly the formula in `tasks/task2_dpo_loss.py`'s docstring, with `π ↔ pθ` and
 `π_ref ↔ pref` in the series' notation. This is why DPO can do what
 SFT can't: **the rejected completion appears in the loss with a
 negative sign.** SFT only ever pushed `log π(y⁺|x)` up. DPO pushes
@@ -850,6 +901,25 @@ you notice it or not.
 
 ## 7. Stage 4 — PPO via verl: the critic finally shows up
 
+**What verl and vLLM actually are, before the theory.** DPO and the RM
+(§5, §6) were plain PyTorch training loops you could read line by
+line. PPO isn't, because PPO needs something SFT/DPO/RM never did:
+*generate from the model being trained, repeatedly, as part of the
+training loop itself* (the "rollout" in the bullet list below) —
+that's a different computational problem (fast autoregressive
+sampling) than gradient descent, and it's expensive enough that hand
+-rolling it well is its own project. `verl` (from ByteDance/HKU) is an
+open-source RLHF/PPO training library that owns exactly that
+orchestration: it drives the actor/critic/reference forward-backward
+passes, applies the clipped-surrogate update below, and hands
+generation to `vLLM` — a separate, widely-used high-throughput LLM
+*inference* engine — for the rollout step specifically, because vLLM
+is dramatically faster at "sample N completions from this model" than
+a plain `model.generate()` loop. You are not implementing either of
+these; you're passing them flags (`--rollout-n`, `--critic-lr`,
+`--kl-coef`, ...) and a reward function, which is exactly what
+`src.toxic_rl.verl_runner` in the commands below does.
+
 ### 7.1 Theory — Posts 11, 12, and 9, all landing here at once
 
 Every advantage estimate in Posts 4–7 (group mean, LOO, OPO) was a
@@ -973,7 +1043,15 @@ more gradually and keeps producing gradient signal longer, because
 different prompts are still eliciting different responses worth
 distinguishing.
 
-Merge the FSDP shards to a loadable HF checkpoint:
+verl trains the actor under FSDP (Fully Sharded Data Parallel — a
+PyTorch technique that splits each layer's parameters, gradients, and
+optimizer state across the available GPUs so no single GPU holds the
+whole model; on this single-H100 setup it mainly means the checkpoint
+verl writes is saved in that sharded on-disk layout rather than as one
+`model.safetensors`). `AutoModelForCausalLM.from_pretrained` can't load
+FSDP shards directly, so before you can run eval or generation against
+this checkpoint, `verl.model_merger` has to reassemble them into an
+ordinary Hugging Face checkpoint directory:
 
 ```bash
 sudo docker run --rm --gpus all --ipc=host \
@@ -1353,7 +1431,8 @@ of the problem and the data you actually have."
 
 ## 9. Submission checklist
 
-Straight from `README.md` — zip exactly this:
+Every file below was produced somewhere in §3–§8 above. Zip exactly
+this:
 
 ```
 tasks/
