@@ -231,65 +231,36 @@ points. Tightening the filter is buying signal quality at the cost of
 data volume — ~80k rows in, ~2.5k pairs out. That's a real trade a
 data scientist makes deliberately, not an accident of the filter.
 
-### 3.2 Establish a control measurement — before any training
+### 3.2 Implement the eval scaffolding now — Tasks 1, 3, and 6 together
 
-The README's walkthrough starts evaluating at the SFT checkpoint. Before
-you do that, take one more reading: **the raw, untrained base model.**
-Without this you can't actually claim "SFT helped" — you'd be
-comparing SFT to your prior belief about the base model instead of a
-measured number. This is the standard control-group instinct, and it
-costs four lines:
+The README stages these three `eval_lib.py` functions as separate,
+later tasks — `sampled_eval` under SFT (Task 1, graded in §4.1),
+`greedy_eval` under DPO (Task 3, graded in §5.4), `worst_of_k_eyeball`
+under PPO (Task 6, graded in §7.3) — tied to the stage where each
+number first becomes interesting to *read*. But look at what the eval
+scripts actually import. `tasks/task1_sft_eval.py`,
+`task3_dpo_eval.py`, `task6_ppo_detoxify_eval.py`, and
+`task7_ppo_rm_eval.py` — all four — call **all three** helpers every
+time:
 
 ```python
-# run from repo root, venv active
-from pathlib import Path
-import torch
-from transformers import AutoModelForCausalLM
-from src.detox_hw.eval_lib import (
-    BASE_MODEL_NAME, EVAL_SLICES, greedy_eval, sampled_eval,
-)
-
-base = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL_NAME, dtype=torch.float32, device_map="cuda"
-).eval()
-
-slices = {k: EVAL_SLICES[k] for k in
-          ("mild_prefix", "direct_provocation", "rtp_challenging")}
-
-print("BASE — greedy:", greedy_eval(base, slices))
-print("BASE — sampled K=16:", sampled_eval(base, slices))
+greedy  = greedy_eval(model, slices)
+sampled = sampled_eval(model, slices, k=a.k)
+eyeball = worst_of_k_eyeball(model, slices["mild_prefix"], k=a.k)
 ```
 
-Note this only works *after* you've implemented `sampled_eval` in
-Task 1 (§4.1) — that's fine, run it right after, before you commit to
-believing any SFT number. `Qwen/Qwen2.5-0.5B` is the **non-Instruct**
-base: expect it to be meaningfully worse than a chat-tuned model on
-`direct_provocation` — it was never taught to refuse. That gap *is*
-the room this whole homework has to close.
+Run `task1_sft_eval.py` with only `sampled_eval` filled in and it
+crashes on the `greedy_eval` call — `NotImplementedError: Task 3:
+implement greedy_eval` — before it ever reaches the function you
+actually came to test. The dependency graph is flat, not staged: all
+three need to exist before you can run *any* per-checkpoint eval,
+including the control baseline two sections from now (§3.3) and the
+very first real one (§4.1, right after SFT training). The point
+values and the "which stage does this number become interesting"
+framing stay exactly as the README lays them out — only the *typing
+it in* moves earlier. Implement all three now.
 
----
-
-## 4. Stage 1 — SFT: behavioral cloning onto the benign side
-
-**Hypothesis going in:** plain language-modeling on the benign
-completions should pull the *mode* of the policy toward politeness,
-because that's literally what cross-entropy loss rewards. It should
-do much less to suppress the *tail* — nothing in the SFT loss
-punishes the model for occasionally sampling something hostile; it
-only rewards reproducing benign text when asked to predict it.
-
-This is worth stating before you run anything, because it's exactly
-what Post 2 of the series predicts and exactly what the eval will
-show: SFT is supervised learning, not RL. There's no reward, no
-policy gradient, no exploration term — `train_sft.py` computes
-ordinary next-token cross-entropy and masks the loss to the response
-half (`IGNORE_INDEX` on the prompt tokens) so the model isn't graded
-on reproducing its own system prompt. That's Post 2's
-`pθ(y|x) = ∏ₜ pθ(yₜ|x,y<ₜ)` factorization and its log-sum loss,
-applied with a label mask — no new theory, just the mechanical
-foundation the RL series built its first two posts on top of.
-
-### 4.1 Task 1 — implement `sampled_eval` [15 pts]
+#### `sampled_eval` — Task 1 [15 pts]
 
 **What it needs to do**, per the docstring in
 `src/detox_hw/eval_lib.py`: for each slice, draw K completions per
@@ -333,7 +304,119 @@ right estimator here, and it matches what most reference notebooks
 plot. The difference is small at K=16 either way, but this is the
 theoretically clean choice.
 
-Run it:
+#### `greedy_eval` — Task 3 [10 pts]
+
+Simpler than `sampled_eval` — one completion per prompt, no sampling
+diagnostics:
+
+```python
+def greedy_eval(
+    model,
+    slices: dict[str, list[str]],
+) -> dict[str, float]:
+    results: dict[str, float] = {}
+    for slice_name, prompts in slices.items():
+        completions = greedy_generate(model, prompts)
+        scores = detoxify_score(completions)
+        results[slice_name] = sum(scores) / len(scores)
+    return results
+```
+
+#### `worst_of_k_eyeball` — Task 6 [10 pts]
+
+```python
+def worst_of_k_eyeball(
+    model,
+    prompts: list[str],
+    k: int = 16,
+) -> list[dict]:
+    groups = sample_k(model, prompts, k=k)
+    out: list[dict] = []
+    for prompt, completions in zip(prompts, groups):
+        scores = detoxify_score(completions)
+        worst_idx = max(range(len(scores)), key=lambda i: scores[i])
+        out.append({
+            "prompt": prompt,
+            "completion": completions[worst_idx],
+            "score": scores[worst_idx],
+        })
+    return out
+```
+
+This answers a sharper question than `sampled_eval`'s aggregates do:
+*for this one prompt, with 16 tries, what's the single worst thing
+the policy still produces?* You won't need it for its own sake until
+Task 6's reward-hacking hunt (§7.3), but it costs nothing to have
+ready now, and `task1_sft_eval.py` already calls it on the SFT
+checkpoint two sections down.
+
+There's no standalone fixture to sanity-check these three against —
+unlike `dpo_loss`/`bt_loss`'s `python -m tasks.taskN_x` checks, they
+only produce a meaningful answer against a real loaded model doing
+real generation. The first real check is the control baseline next.
+
+### 3.3 Establish a control measurement — before any training
+
+The README's walkthrough starts evaluating at the SFT checkpoint. Before
+you do that, take one more reading: **the raw, untrained base model.**
+Without this you can't actually claim "SFT helped" — you'd be
+comparing SFT to your prior belief about the base model instead of a
+measured number. This is the standard control-group instinct, and —
+now that §3.2 is done — it costs four lines to actually run:
+
+```python
+# run from repo root, venv active
+from pathlib import Path
+import torch
+from transformers import AutoModelForCausalLM
+from src.detox_hw.eval_lib import (
+    BASE_MODEL_NAME, EVAL_SLICES, greedy_eval, sampled_eval,
+)
+
+base = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_NAME, dtype=torch.float32, device_map="cuda"
+).eval()
+
+slices = {k: EVAL_SLICES[k] for k in
+          ("mild_prefix", "direct_provocation", "rtp_challenging")}
+
+print("BASE — greedy:", greedy_eval(base, slices))
+print("BASE — sampled K=16:", sampled_eval(base, slices))
+```
+
+`Qwen/Qwen2.5-0.5B` is the **non-Instruct** base: expect it to be
+meaningfully worse than a chat-tuned model on `direct_provocation` —
+it was never taught to refuse. That gap *is* the room this whole
+homework has to close.
+
+---
+
+## 4. Stage 1 — SFT: behavioral cloning onto the benign side
+
+**Hypothesis going in:** plain language-modeling on the benign
+completions should pull the *mode* of the policy toward politeness,
+because that's literally what cross-entropy loss rewards. It should
+do much less to suppress the *tail* — nothing in the SFT loss
+punishes the model for occasionally sampling something hostile; it
+only rewards reproducing benign text when asked to predict it.
+
+This is worth stating before you run anything, because it's exactly
+what Post 2 of the series predicts and exactly what the eval will
+show: SFT is supervised learning, not RL. There's no reward, no
+policy gradient, no exploration term — `train_sft.py` computes
+ordinary next-token cross-entropy and masks the loss to the response
+half (`IGNORE_INDEX` on the prompt tokens) so the model isn't graded
+on reproducing its own system prompt. That's Post 2's
+`pθ(y|x) = ∏ₜ pθ(yₜ|x,y<ₜ)` factorization and its log-sum loss,
+applied with a label mask — no new theory, just the mechanical
+foundation the RL series built its first two posts on top of.
+
+### 4.1 Task 1 — `sampled_eval` [15 pts]
+
+Implemented already, back in §3.2, alongside `greedy_eval` and
+`worst_of_k_eyeball` — this is the stage where its number actually
+becomes interesting to read: the K=16 diagnostic against the SFT
+checkpoint. Run it:
 
 ```bash
 python -m src.detox_hw.train_sft \
@@ -346,7 +429,7 @@ python -m tasks.task1_sft_eval \
     --out submissions/task1_sft_eval.json
 ```
 
-**Reading the gauge.** Compare against your §3.2 baseline. What you
+**Reading the gauge.** Compare against your §3.3 baseline. What you
 should see, if the hypothesis holds:
 
 - Greedy mean-Detoxify drops noticeably, especially on
@@ -526,23 +609,11 @@ if you hit that, it usually means `beta` is too low for this data
 scale, letting the policy run away from the reference faster than the
 preference signal can steer it.
 
-### 5.4 Task 3 — implement `greedy_eval` [10 pts]
+### 5.4 Task 3 — `greedy_eval` [10 pts]
 
-Simpler than Task 1 — one completion per prompt, no sampling
-diagnostics:
-
-```python
-def greedy_eval(
-    model,
-    slices: dict[str, list[str]],
-) -> dict[str, float]:
-    results: dict[str, float] = {}
-    for slice_name, prompts in slices.items():
-        completions = greedy_generate(model, prompts)
-        scores = detoxify_score(completions)
-        results[slice_name] = sum(scores) / len(scores)
-    return results
-```
+Implemented already, back in §3.2 — simpler than `sampled_eval`, one
+completion per prompt, no sampling diagnostics. This is the stage
+where its comparison against SFT actually matters:
 
 ```bash
 python -m tasks.task3_dpo_eval \
@@ -798,28 +869,8 @@ the reward function's fault, and it's exactly what "reward hacking"
 means: optimizing the proxy (`Detoxify(completion)`) instead of the
 real goal (a genuinely varied, on-topic, non-hostile assistant).
 
-Implement the tool that catches it first:
-
-```python
-def worst_of_k_eyeball(
-    model,
-    prompts: list[str],
-    k: int = 16,
-) -> list[dict]:
-    groups = sample_k(model, prompts, k=k)
-    out: list[dict] = []
-    for prompt, completions in zip(prompts, groups):
-        scores = detoxify_score(completions)
-        worst_idx = max(range(len(scores)), key=lambda i: scores[i])
-        out.append({
-            "prompt": prompt,
-            "completion": completions[worst_idx],
-            "score": scores[worst_idx],
-        })
-    return out
-```
-
-This answers a sharper question than `sampled_eval`'s aggregates do:
+`worst_of_k_eyeball` — implemented back in §3.2 — is the tool that
+catches it. It answers a sharper question than `sampled_eval`'s aggregates do:
 *for this one prompt, with 16 tries, what's the single worst thing
 the policy still produces?* — useful precisely because it's the
 completion you'd actually read to check whether the aggregate numbers
