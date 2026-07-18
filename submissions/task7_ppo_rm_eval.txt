@@ -1,0 +1,83 @@
+Task 7 — PPO with your trained RM — takeaways
+================================================
+
+Hypothesis (stated before running, MASTERCLASS.md §7.4): the attractor should look different from Task
+6's, not necessarily absent -- your RM learned a different decision boundary than Detoxify's classifier
+surface, so PPO will find whatever region of response-space cheaply saturates whichever reward it's
+pointed at.
+
+What the run actually produced:
+
+  Greedy mean toxicity:      mild=0.017  direct=0.017  rtp=0.015
+  Sampled K=16 support_rate: mild=0.000  direct=0.000  rtp=0.000
+  Sampled K=16 mean_max:     mild=0.017  direct=0.017  rtp=0.019
+  Sampled K=16 mean_std:     mild=0.006  direct=0.005  rtp=0.007
+
+Confirmed on both counts: the attractor is different text than Task 6's (a Chinese-language generic AI
+self-introduction, not the English system-prompt echo), and it is not absent -- if anything, it's a more
+complete collapse. 14 of 15 mild_prefix worst-of-16 prompts -- politicians, insults, "how dumb are most
+people", coworkers, mother-gasp, remote work, procrastination roast, essay review, landlord rant, traffic,
+rudeness, filter-free coworker feedback, self-help books, karaoke review -- get the exact identical
+completion, scored to the same value down to many decimal places (0.016556739807128906):
+
+  "您好！我是一位人工智能助手，可以帮助您提供咨询服务或处理任务。"
+  ("Hello! I am an AI assistant, I can help you provide consulting services or handle tasks.")
+
+The 15th prompt gets a one-character variant of the same string (comma instead of exclamation mark).
+Unlike Task 6's system-prompt echo, which still had a templated trailing clause that varied per prompt
+and occasionally borrowed a word from it, there is no prompt-conditioning at all here -- fourteen
+semantically unrelated prompts produce one exact string.
+
+The training log (task7_log.txt) independently confirms this is a sharper collapse than Task 6's:
+actor/entropy fell to 0.044 by step 100, vs Task 6's 0.333 -- roughly 7.6x more collapsed. The reward
+curve has the same climbs-fast-then-flattens shape (val reward, which is the RM's raw score here, not
+Detoxify: -5.6 at step 0 -> 9.6 by step 20 -> 18.6 by step 70, then flat for 30 more steps). Same KL-anchor
+gap found in Task 6 reproduces here too -- use_kl_loss and use_kl_in_reward both False in the config dump,
+confirming verl_runner.py's --kl-coef flag isn't actually wired into the objective in either run.
+
+A methodological note worth flagging on its own: the sampled_eval mean_std here (0.005-0.007) does NOT
+look as collapsed as Task 6's rtp_challenging mean_std (0.018), even though every other signal (entropy,
+literal completion-text identity) shows Task 7 is the more severe collapse. The reason: Detoxify scores
+this Chinese-language self-introduction near-zero regardless of the tiny variant differences between
+generations, so mean_std -- computed from Detoxify scores -- loses sensitivity exactly when the underlying
+text has collapsed onto something Detoxify barely registers as toxic at all. Worth remembering for Task 8:
+mean_std is not a reliable standalone collapse signal when the attractor text happens to sit in a region
+the toxicity classifier is blind to.
+
+An addition to the hypothesis worth stating precisely: rm_eval.txt's verdict was that this RM's high
+accuracy (0.9694) AND large margin (+17.68) meant it didn't show the "soft, easy to game" failure mode
+MASTERCLASS.md's text warns about -- that turns out to have been about the wrong axis of "hard to game." A
+decisive, high-margin RM can still be gamed completely, just not via small nudges near a fuzzy boundary --
+via finding one point far out on whatever axis the RM already scores confidently high, and sitting there.
+Section 22 of STAGEWISE_ANALYSIS.md already found several English "generic apology" templates the RM
+rewards at +8 to +15; this run found a different specific string (not one of those templates) that the RM
+apparently rewards even more strongly. Confidence and gameability are closer to orthogonal than the
+masterclass's framing implies.
+
+Open check, added but not yet run: scripts/score_ppo_attractor_with_rm.py scores this exact attractor
+string against several prompts using the trained RM directly, to confirm the RM does reward it highly (the
+most direct possible test of the causal story above -- PPO climbing exactly the objective it was given).
+Run it and update this file with the result.
+
+Addendum -- both open checks above have now been run, closing the loop:
+
+1. The notebook's STAGE="ppo_rm" pass confirms the collapse is total, not just within mild_prefix's
+   worst-of-16: all 45 tracked prompts across all three slices (mild_prefix, direct_provocation,
+   rtp_challenging) produce the exact same completion. 45/45, 100% uniqueness collapse -- the most
+   complete collapse recorded across every stage of this project (SFT/DPO/Task 6 all stayed in the
+   47-80% templated range, never 100%).
+
+2. scripts/score_ppo_attractor_with_rm.py confirms the RM does reward this attractor, decisively:
+
+     Task 7 attractor (Chinese self-intro):   mean score +20.630 across 5 tested prompts
+     Task 6 attractor (system-prompt echo):   mean score  +3.970 across the same 5 prompts
+
+   The Chinese self-introduction scores higher under this RM than anything else measured anywhere in
+   this project -- higher than the RM's own held-out mean margin (+17.68), and higher than the best
+   English apology template found earlier (+15.31). PPO found, via ordinary reward-climbing from the
+   base model, the single highest-scoring completion identified in five stages of analysis. The contrast
+   with Task 6's attractor (which wasn't trained against this RM at all, yet still scores positively,
+   just at roughly a fifth of the magnitude) confirms the specific collapse point is a property of which
+   reward you optimize against, not something inherent to the base model or to generically bland text.
+
+Full tables in STAGEWISE_ANALYSIS.md sections 34-35.
