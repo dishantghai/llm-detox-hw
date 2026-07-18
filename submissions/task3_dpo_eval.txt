@@ -1,15 +1,14 @@
 Task 3 — greedy_eval / DPO checkpoint — takeaways
 ===================================================
 
-Hypothesis (stated before running, MASTERCLASS.md §5.4): DPO should beat SFT more on
-support_rate/mean_std (tail suppression -- DPO's unique mechanism, since it explicitly penalizes
-log pi(y-|x) via the rejected term) than on the greedy mean (mode placement, which SFT already mostly
-handled). If DPO's improvement shows up almost entirely in the greedy number and barely in the sampled
-numbers, that's a sign the rejected-side penalty isn't translating into genuine distributional
-narrowing.
+Hypothesis (stated before running): DPO should beat SFT more on support_rate/mean_std (tail suppression
+-- DPO's unique mechanism, since it explicitly penalizes log pi(y-|x) via the rejected term) than on the
+greedy mean (mode placement, which SFT already mostly handled). If DPO's improvement shows up almost
+entirely in the greedy number and barely in the sampled numbers, that's a sign the rejected-side penalty
+isn't translating into genuine distributional narrowing.
 
-Three-way comparison, base -> SFT -> DPO (submissions/stage_gauge_history.json, cross-checked against
-this file's own greedy/sampled output):
+Three-way comparison, base -> SFT -> DPO (base/SFT numbers from task1_sft_eval.txt, cross-checked
+against this file's own greedy/sampled output for the dpo row):
 
                         base      sft       dpo
   greedy  mild          0.073     0.0059    0.0010
@@ -34,18 +33,18 @@ is gone after DPO.
 A complication the hypothesis doesn't anticipate, worth flagging rather than hiding behind the clean
 numbers above: "genuine distributional narrowing" turns out to be ambiguous between two different
 things, and this run's data shows the less desirable one. DPO did not break the "generic non-answer"
-pattern flagged in Task 1's writeup -- it entrenched it further. Completion uniqueness across the same
-45 tracked prompts stayed at 47% (21/45 unique, same rate as SFT), but the count of prompts answered
-with a repeated template rose from 28/45 (62%, SFT) to 32/45 (71%, DPO), now spread across a slightly
-larger template vocabulary ("I'm sorry, I don't understand what you're asking." x12, "I'm sorry, I
-didn't mean to be rude." x3, "I'm sorry to hear that." x2, etc. -- full breakdown in
-STAGEWISE_ANALYSIS.md section 11). DPO's rejected-side penalty appears to be reinforcing "give a
-generic apologetic non-answer" as a locally-optimal way to keep log pi(y-|x) low everywhere at once,
-rather than teaching the model to distinguish which specific responses are actually appropriate. The
-mean_std collapse itself (down to 0.004-0.048, near-zero on two of three slices) is evidence of this:
-per the entropy-collapse framing this project's eval scaffolding is built to catch, a mean_std this low
-means the policy has stopped varying its output with the prompt almost entirely -- consistent with
-"settled on a small set of templates," not "learned nuanced, prompt-specific politeness."
+pattern flagged in task1_sft_eval.txt -- it entrenched it further. Generating greedy completions from
+the DPO checkpoint across the same broader 45-prompt sample used for the SFT check (drawn from
+eval_lib.py's three slices) shows completion uniqueness held flat at 47% (21/45 unique, same rate as
+SFT), but the count of prompts answered with a repeated template rose from 28/45 (62%, SFT) to 32/45
+(71%, DPO), now spread across a slightly larger template vocabulary ("I'm sorry, I don't understand
+what you're asking." x12, "I'm sorry, I didn't mean to be rude." x3, "I'm sorry to hear that." x2,
+etc.). DPO's rejected-side penalty appears to be reinforcing "give a generic apologetic non-answer" as a
+locally-optimal way to keep log pi(y-|x) low everywhere at once, rather than teaching the model to
+distinguish which specific responses are actually appropriate. The mean_std collapse itself (down to
+0.004-0.048, near-zero on two of three slices) is evidence of this: low mean_std means the policy has
+stopped varying its output with the prompt almost entirely -- consistent with "settled on a small set of
+templates," not "learned nuanced, prompt-specific politeness."
 
 Verdict: DPO's improvement over SFT shows up overwhelmingly in the sampled numbers (tail), not the
 already-near-zero greedy number -- the theoretical prediction about *where* the improvement lands holds
@@ -53,6 +52,6 @@ exactly. But the mechanism behind DPO's near-total tail suppression is the same 
 pattern flagged at SFT, now more entrenched rather than resolved. Worth checking at the RM/PPO stages
 whether a reward signal that isn't literally "avoid the rejected examples" can pull the model off this
 attractor, or whether it's a stable local optimum this small a model falls into under any of this
-homework's training signals -- MASTERCLASS.md's own Task 8 design (a relevance term to break
-prompt-independent template attractors) is direct evidence this concern was anticipated, just not until
-two stages later than where it first actually appears.
+homework's training signals -- Task 8's custom reward design (a relevance term meant to break
+prompt-independent template attractors) is direct evidence this concern was anticipated by the homework
+itself, just not observed until two stages later than where it first actually appears.
