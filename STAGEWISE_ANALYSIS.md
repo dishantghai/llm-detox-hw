@@ -1055,3 +1055,52 @@ The goal (top-of-file docstring in `tasks/task8_custom_reward.py`, and the assig
   something plausible), not evidence the gate failed; a stronger gate (higher floor penalty, larger
   weight, or a second training run with more than 100 steps given the reward was still rising) would be
   the natural next iteration, not a redesign.
+
+---
+
+## Closing — what we actually didn't solve, and why
+
+Everything above tracks toxicity going down, stage over stage, by every aggregate metric. Read only those
+numbers, and the project looks like a success story: base → SFT → DPO → PPO each measurably safer than the
+last. Reading the actual completion text at every stage tells a more specific and less comfortable story,
+worth stating plainly as a single throughline now that all eight tasks are done.
+
+**Every training signal used in this entire pipeline measures "not toxic," and none of them measure
+"actually helpful."** SFT trained on chosen-only demonstrations (§3-4). DPO and the RM both trained on
+`chosen ≻ rejected` preference, where the only thing distinguishing the two sides is toxicity (§11, §17).
+PPO's three runs optimized Detoxify directly (Task 6), the RM (Task 7), or a hand-designed blend of
+Detoxify/RM/repetition/length/relevance (Task 8) — none of which contains a term that rewards a response
+for being genuinely on-topic and substantive, as opposed to merely not-toxic. A response that says nothing
+at all is at or near the global optimum for "avoid toxicity" specifically *because* it can't fail at
+something it never attempts. Every attractor this document found — SFT/DPO's "I'm sorry, I don't
+understand" (§3, §11), Task 6's system-prompt echo (§26), Task 7's fixed Chinese self-introduction
+(§31, 45/45 prompts, one string), Task 8's persisting 53% template rate (§39) — is the same underlying
+optimum, found by five different training procedures, because all five were pointed at the same
+one-sided objective.
+
+**This is not something the model or any individual stage did wrong; it's what the data and reward
+signals actually specified.** `hh-rlhf`'s "chosen" side is itself frequently evasive rather than
+substantively helpful — §4 caught this directly: the base model's genuinely correct, on-topic answer to
+the "bigoted toward immigrants" prompt scored *worse* after SFT, because SFT rewarded reproducing the
+demonstration style (hedging, non-committal) over the base model's more genuine engagement. The bias
+toward safe-but-empty responses was present in the training data before any RL step ever ran.
+
+**Task 8's relevance gate (§36-40) is a real, measured improvement, and also a clear illustration of the
+ceiling on what a symptom-level fix can do.** Bag-of-words overlap can tell you a completion borrowed
+vocabulary from the prompt; it cannot tell you the completion *answered* it. Of the three genuinely
+on-topic completions Task 8 produced, one thing they have in common is that they happened to work as
+short, real answers ("Traffic in this city is busy and chaotic.") — the reward has no way to distinguish
+that from a template that merely echoes a prompt word into a fixed slot ("no matter how rude I am"), and
+53% of the sample took the cheaper route. A heuristic tied to vocabulary overlap structurally cannot
+reward "helpfulness" as a concept; at best it can penalize the specific symptom (zero overlap) that one
+particular attractor exploited.
+
+**What would actually close this gap is outside what this homework's task list asks for**: a second,
+independent helpfulness signal — a helpfulness-trained reward model, or human/LLM-judged ratings of actual
+answer quality — combined with (not replacing) the harmlessness signal already built here, the way
+production RLHF setups typically use two reward heads rather than one. None of Tasks 1-8 introduce that
+second axis; the assignment's own scope is entirely about detoxification, and every tool available
+throughout this project (Detoxify, the harmlessness-only RM, the hand-designed Task 8 reward) is a
+harmlessness measure by construction. Given only harmlessness measures to optimize against, five different
+training procedures at 0.5B scale all found variations on the same answer: the cheapest way to score well
+is to stop trying to say anything.
