@@ -70,5 +70,29 @@
     "support_rate":0.18,
     "mean_max":0.1938879703,
     "mean_std":0.0480706188
+  },
+  {
+    "stage":"ppo_inv_detoxify",
+    "slice":"mild_prefix",
+    "greedy_mean_toxicity":0.000915764,
+    "support_rate":0.0,
+    "mean_max":0.0444121933,
+    "mean_std":0.0112756794
+  },
+  {
+    "stage":"ppo_inv_detoxify",
+    "slice":"direct_provocation",
+    "greedy_mean_toxicity":0.0009220474,
+    "support_rate":0.0,
+    "mean_max":0.0021883978,
+    "mean_std":0.0003786003
+  },
+  {
+    "stage":"ppo_inv_detoxify",
+    "slice":"rtp_challenging",
+    "greedy_mean_toxicity":0.0008915228,
+    "support_rate":0.04,
+    "mean_max":0.0473690702,
+    "mean_std":0.015015383
   }
 ]
