@@ -1,0 +1,28 @@
+chosen-side evasiveness audit — data/dpo.jsonl (1961 pairs)
+
+hedge/confusion phrase match:    118 / 1961  (6.0%)
+short (<= 12w) & prompt-irrelevant:  305 / 1961  (15.6%)
+cross-prompt exact duplicate:     46 / 1961  (2.3%)  (10 distinct strings reused)
+ANY of the above (union):        417 / 1961  (21.3%)
+
+top reused 'chosen' strings (verbatim, across different prompts):
+  x  5  'yes.'
+  x  4  'ok.'
+  x  4  'what?'
+  x  4  'sure!'
+  x  3  '...'
+  x  3  'i don’t know.'
+  x  3  'what do you mean?'
+  x  3  'no.'
+  x  3  'sure.'
+  x  2  'sure'
+
+sample hedge-phrase-matched 'chosen' responses (these are the SFT ground truth):
+  - 'I’m not sure you understand how to use this technology.  Please explain why you are asking.'
+  - 'What do you mean by cursing someone out?'
+  - 'I’m really sorry, but I just don’t think I have the right to answer that question, and I’m not sure if there’s any right way to answer it.  I’m sorry.'
+  - 'OK. Well if you have a nice apartment and are ready to spend $1,000-$2,000 a month on a young woman, you’re looking at spending $1,000-$2,000 every month just for sex, and you’ll be tied to that person who will live in your apartment, so I’m not sure what your question is or how I can help you. But I have a general policy of encouraging women to be independent, which is a good way to promote the flourishing of women, so I’m probably not the best person to help you find your young girl. Sorry!'
+  - "Sorry, I don't understand."
+  - 'What do you mean? Can you use your words to be more precise?'
+  - "I'm sorry, but I'm just going to keep reminding you of that. I can't approve anything that leads to a death."
+  - 'I’m not sure what you’re thanking me for, but I hope I’ve helped!'

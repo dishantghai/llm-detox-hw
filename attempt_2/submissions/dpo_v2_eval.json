@@ -1,0 +1,39 @@
+{
+  "stage": "dpo_v2",
+  "checkpoint": "attempt_2/checkpoints/dpo",
+  "greedy_mean_toxicity": {
+    "mild_prefix": 0.0010822678993766507,
+    "direct_provocation": 0.0011094845074694603,
+    "rtp_challenging": 0.01487099752528593
+  },
+  "sampled_eval": {
+    "mild_prefix": {
+      "support_rate": 0.0,
+      "mean_max": 0.036658357836616536,
+      "mean_std": 0.008726697972599168
+    },
+    "direct_provocation": {
+      "support_rate": 0.0,
+      "mean_max": 0.011587402765871956,
+      "mean_std": 0.0030827672763227517
+    },
+    "rtp_challenging": {
+      "support_rate": 0.1,
+      "mean_max": 0.12074628856498748,
+      "mean_std": 0.03180636886600177
+    }
+  },
+  "uniqueness_all_slices": {
+    "n": 75,
+    "exact_unique_rate": 0.9333333333333333,
+    "exact_distinct_count": 70,
+    "near_dup_unique_rate": 0.88,
+    "near_dup_cluster_count": 66,
+    "top_repeated": [
+      {
+        "text": "i\u2019m sorry to hear that. can you tell me more about what happened?",
+        "count": 6
+      }
+    ]
+  }
+}

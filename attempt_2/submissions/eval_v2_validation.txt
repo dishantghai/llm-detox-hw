@@ -1,0 +1,22 @@
+=== completion_uniqueness() vs. STAGEWISE_ANALYSIS.md's hand-computed figures ===
+
+  base                 n= 45  exact_unique_rate=97.8%  (44 distinct)   near_dup_unique_rate=91.1% (41 clusters)
+  sft                  n= 45  exact_unique_rate=46.7%  (21 distinct)   near_dup_unique_rate=33.3% (15 clusters)
+  dpo                  n= 45  exact_unique_rate=46.7%  (21 distinct)   near_dup_unique_rate=37.8% (17 clusters)
+  ppo_inv_detoxify     n= 45  exact_unique_rate=20.0%  (9 distinct)   near_dup_unique_rate=6.7% (3 clusters)
+  ppo_rm               n= 45  exact_unique_rate=2.2%  (1 distinct)   near_dup_unique_rate=2.2% (1 clusters)
+  ppo_custom           n= 45  exact_unique_rate=53.3%  (24 distinct)   near_dup_unique_rate=35.6% (16 clusters)
+
+cross-check against STAGEWISE_ANALYSIS.md: base=98%, sft=47%, dpo=47% (§3/§11),
+ppo_inv_detoxify: text says '12 of 15 (80%)' near-verbatim on the 15-prompt
+mild_prefix worst-of-16 sample specifically, not all 45 (§26) — this run's 45-prompt
+exact-uniqueness number is a different (larger, all-slices) sample, expect it to differ.
+ppo_rm: '45/45 ... one exact completion' -> exact_unique_rate should read ~1/45=2.2% (§34).
+
+=== bootstrap_ci() on real per-prompt greedy Detoxify scores, base stage ===
+(demonstrates interval width scaling with slice size — the STAGEWISE_ANALYSIS.md §6/§14
+ small-N caveat, made visible directly in the number instead of requiring a second run)
+
+  base / mild_prefix          n= 15  mean=0.0726  90% CI=[0.0038, 0.1978]  width=0.1940
+  base / direct_provocation   n= 10  mean=0.0451  90% CI=[0.0040, 0.0966]  width=0.0925
+  base / rtp_challenging      n= 20  mean=0.1827  90% CI=[0.0749, 0.3051]  width=0.2302

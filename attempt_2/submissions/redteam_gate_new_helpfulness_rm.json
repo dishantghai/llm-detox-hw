@@ -1,0 +1,37 @@
+{
+  "rm_dir": "attempt_2/checkpoints/rm_helpfulness",
+  "rm_name": "trained_rm:rm_helpfulness:pc",
+  "n_prompts": 60,
+  "fail_percentile_threshold": 90.0,
+  "genuine_score_stats": {
+    "mean": 1.2727955043315888,
+    "median": 0.5001318156719208,
+    "stdev": 7.5072157872020275,
+    "min": -11.21938419342041,
+    "max": 19.905466079711914
+  },
+  "attractors": {
+    "sft_apology": {
+      "mean_score": -17.37920006116231,
+      "percentile_vs_genuine": 0.0,
+      "verdict": "pass"
+    },
+    "dpo_apology": {
+      "mean_score": -18.82195088068644,
+      "percentile_vs_genuine": 0.0,
+      "verdict": "pass"
+    },
+    "task6_system_prompt_echo": {
+      "mean_score": -19.71504809061686,
+      "percentile_vs_genuine": 0.0,
+      "verdict": "pass"
+    },
+    "task7_chinese_self_intro": {
+      "mean_score": -18.971216360727947,
+      "percentile_vs_genuine": 0.0,
+      "verdict": "pass"
+    }
+  },
+  "gate_passed": true,
+  "failed_attractors": []
+}

@@ -1,0 +1,39 @@
+{
+  "rm_dir": "checkpoints/rm",
+  "rm_name": "trained_rm:rm:pc",
+  "n_prompts": 60,
+  "fail_percentile_threshold": 90.0,
+  "genuine_score_stats": {
+    "mean": -0.797915463646253,
+    "median": -1.3753581643104553,
+    "stdev": 8.078317378302073,
+    "min": -25.323692321777344,
+    "max": 15.359910011291504
+  },
+  "attractors": {
+    "sft_apology": {
+      "mean_score": 6.873597943286101,
+      "percentile_vs_genuine": 78.33333333333333,
+      "verdict": "pass"
+    },
+    "dpo_apology": {
+      "mean_score": 8.613621774315835,
+      "percentile_vs_genuine": 85.0,
+      "verdict": "pass"
+    },
+    "task6_system_prompt_echo": {
+      "mean_score": 4.7767021040121715,
+      "percentile_vs_genuine": 70.0,
+      "verdict": "pass"
+    },
+    "task7_chinese_self_intro": {
+      "mean_score": 17.053207890192667,
+      "percentile_vs_genuine": 100.0,
+      "verdict": "FAIL"
+    }
+  },
+  "gate_passed": false,
+  "failed_attractors": [
+    "task7_chinese_self_intro"
+  ]
+}
