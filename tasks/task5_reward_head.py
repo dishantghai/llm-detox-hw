@@ -62,8 +62,6 @@ def build_rm(
         ``SequenceClassifierOutput`` whose ``.logits`` has shape
         ``(batch, 1)`` (squeeze the last dim to get ``(batch,)`` scores).
     """
-    # <YOUR CODE HERE>
-    # raise NotImplementedError("Task 5: implement build_rm")
     model = AutoModelForSequenceClassification.from_pretrained(
         base_name, num_labels=1, dtype=torch.float32,
     )
@@ -103,8 +101,6 @@ def rm_step(rm, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Ten
     Import ``bt_loss`` from ``tasks.task4_bt_loss`` (already imported
     at the top of this file).
     """
-    # <YOUR CODE HERE>
-    # raise NotImplementedError("Task 5: implement rm_step")
     chosen_scores = rm(
         input_ids=batch["chosen_ids"], attention_mask=batch["chosen_attn"],
     ).logits.squeeze(-1)
