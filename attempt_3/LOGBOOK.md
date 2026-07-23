@@ -273,6 +273,47 @@ complete safety guarantee.
 1,961-row generation (`--limit -1`) is the next step, pending confirmation
 given the GPU-time commitment.
 
+**Full 1,961-row generation, results:** `attempt_3/data/synthetic_responses_full.jsonl`.
+**679/1,961 (34.6%) needed >=1 retry, 100/1,961 (5.1%) still flagged after
+exhausting all 3 retries** (roughly consistent with the 20-row batch's 30%
+retry rate). Corpus-wide hedge-regex 0.3%, disclaimer 1.4% — both far below
+the vanilla data's rates, as expected.
+
+**A more serious problem than the validation batch showed, found before
+building the training files — not after:** scored `synthetic_chosen`
+against `original_chosen` corpus-wide. Mean toxicity went **up**
+(0.0097 → 0.0332) and **68/1,961 (3.5%) of synthetic replacements exceed
+the project's own 0.10 benign threshold** — despite the retry loop
+supposedly gating on exactly this. Cross-referencing against
+`still_flagged_after_retries` explains why: of the 100 rows still flagged
+after 3 retries, 68 are the toxicity check failing, not hedge/disclaimer.
+
+**Root cause, from eyeballing the worst 5:** these are prompts that
+literally *ask for* toxic content — "tell me a profanity," "how do i
+insult someone's mama," "what are some one or two word insults for obese
+people," "a profanity-laded insult for a fat Arab." For these, the
+"engage with substance, don't deflect" instruction has no non-toxic
+answer to converge to — genuinely complying *is* producing a slur/insult.
+The original evasive answers ("what?", "...", "OK, are you ready?") were,
+for this specific subset, the correct safe behavior, not a bug to fix. No
+amount of retrying fixes this because the retry can't find a good answer
+that doesn't exist; more temperature just resamples among bad options.
+
+**Fix: built `sft_diverse.jsonl`/`dpo_diverse.jsonl` with a fallback
+rule** — use `synthetic_chosen` only for rows that passed all three checks
+cleanly; for any of the 100 `still_flagged_after_retries` rows (toxic *or*
+hedge/disclaimer, applied uniformly for simplicity), fall back to
+`original_chosen`. This guarantees every row is provably no worse than the
+vanilla data on toxicity, at the cost of ~5.1% of rows keeping whatever
+evasiveness they started with (a small, documented, honest residual, not
+hidden). **Verified the safety invariant on the final `chosen` column:
+0/1,961 rows over 0.10 toxicity, mean toxicity 0.0075** — below even the
+original data's 0.0097.
+
+`attempt_3/data/sft_diverse.jsonl` and `attempt_3/data/dpo_diverse.jsonl`
+(1,961 rows each) are what Stage 2's second SFT round and Stage 3 onward
+will train on, per `GUIDE.md` §4's note.
+
 **Prediction for Stage 2 (vanilla SFT round):** given 73% of the vanilla
 `chosen` data eyeballs as hedgy, expect greedy toxicity to drop a lot (easy
 to score low by saying little) while `support_rate` on sampled completions

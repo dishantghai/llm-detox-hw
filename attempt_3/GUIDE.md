@@ -453,13 +453,59 @@ python -m attempt_3.data_prep.generate_synthetic_responses \
     --out attempt_3/data/synthetic_responses_full.jsonl
 ```
 
-**Step 4 — build `sft_diverse.jsonl` / `dpo_diverse.jsonl`** from the
-full-corpus synthetic output (`prompt` + `synthetic_chosen` for SFT;
-`prompt` + `synthetic_chosen` + original `rejected_toxic` for DPO — no
-script for this exists yet, it's a small `json.loads`/`json.dumps` loop
-over `synthetic_responses_full.jsonl`). These, not `sft.jsonl`/`dpo.jsonl`,
-are what Stage 2's *second* SFT round and Stage 3 onward should train on —
-see the note at the top of Stage 2 below.
+**Step 4 — check the full-corpus output before building the training
+files, don't assume the validation batch's numbers generalize.** On this
+run they didn't, cleanly: corpus-wide, 679/1,961 (34.6%) rows needed a
+retry and 100/1,961 (5.1%) were still flagged after exhausting all 3 —
+consistent with the 20-row batch's ~30% retry rate. But scoring
+`synthetic_chosen` vs `original_chosen` corpus-wide found **68/1,961
+(3.5%) synthetic replacements exceeding the 0.10 benign threshold** — a
+real regression the 20-row sample didn't surface at that scale. Root
+cause, from eyeballing the worst offenders: prompts that literally *ask
+for* toxic content ("tell me a profanity," "insults for obese people," "a
+profanity-laded insult for a fat Arab") have no non-toxic way to comply —
+"engage with substance instead of deflecting" has nothing good to converge
+to there, and the original evasive answer was the *correct* safe behavior
+for that specific subset, not a bug. More retries can't fix this; the
+retry loop was resampling among bad options.
+
+**Fix — build `sft_diverse.jsonl` / `dpo_diverse.jsonl` with a fallback
+rule**, not a straight copy of `synthetic_chosen`: use the synthetic
+response only for rows that passed all three checks (hedge, disclaimer,
+toxicity) cleanly; for the ~5% still flagged after retries, fall back to
+`original_chosen`. This guarantees every row is provably no worse than the
+vanilla data on toxicity — verify this explicitly, don't just assume the
+fallback worked:
+
+```bash
+python -c "
+import json
+from src.detox_hw import eval_lib
+
+rows = [json.loads(l) for l in open('attempt_3/data/synthetic_responses_full.jsonl')]
+sft_out, dpo_out, final_chosen = [], [], []
+for r in rows:
+    chosen = r['original_chosen'] if r['still_flagged_after_retries'] else r['synthetic_chosen']
+    final_chosen.append(chosen)
+    sft_out.append({'prompt': r['prompt'], 'response': chosen})
+    dpo_out.append({'prompt': r['prompt'], 'chosen': chosen, 'rejected': r['rejected_toxic']})
+
+with open('attempt_3/data/sft_diverse.jsonl', 'w') as f:
+    for row in sft_out: f.write(json.dumps(row) + '\n')
+with open('attempt_3/data/dpo_diverse.jsonl', 'w') as f:
+    for row in dpo_out: f.write(json.dumps(row) + '\n')
+
+scores = eval_lib.detoxify_score(final_chosen)
+over = sum(1 for s in scores if s > 0.10)
+print(f'{over}/{len(scores)} final chosen rows over 0.10 toxicity (must be 0)')
+print(f'mean toxicity: {sum(scores)/len(scores):.4f}')
+"
+```
+
+On this run: **0/1,961 over threshold, mean toxicity 0.0075** — below even
+the original data's 0.0097. `sft_diverse.jsonl`/`dpo_diverse.jsonl`, not
+`sft.jsonl`/`dpo.jsonl`, are what Stage 2's *second* SFT round and Stage 3
+onward should train on — see the note at the top of Stage 2 below.
 
 ---
 
