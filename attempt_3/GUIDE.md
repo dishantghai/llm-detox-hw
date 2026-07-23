@@ -74,8 +74,17 @@ reward-hacking yourself when you get there.
   section for the caveats on smaller cards).
 - `docker`, with `nvidia-container-toolkit` so containers see the GPU.
 - The repo's Python venv, already set up with `torch`, `transformers`,
-  `peft`, `datasets`, `detoxify`, `scikit-learn`, `tqdm` (see
-  `requirements.txt` / `README.md` §Environment if you need to rebuild it).
+  `peft`, `datasets`, `detoxify`, `scikit-learn`, `tqdm`, `openai`,
+  `python-dotenv` (see `requirements.txt` / `README.md` §Environment if
+  you need to rebuild it — `openai`/`python-dotenv` were added in this run
+  for §3.3's API-based synthetic data generation).
+- **Optional but recommended for §3.3**: an API key for a hosted large
+  instruct model (this run used `NEBIUS_API_KEY` for Nebius AI Studio).
+  Put it in a `.env` file at the repo root (`NEBIUS_API_KEY=...`) — `.env`
+  is already gitignored. Without one, §3.3 falls back to a local
+  `Qwen2.5-1.5B-Instruct` teacher, which this run found reintroduces its
+  own hedging habits (see §3.3's v1/v2 history) — workable, but expect to
+  spend more retry-loop effort getting clean output.
 
 Verify both before touching any code:
 
@@ -361,12 +370,53 @@ Compare the union rate against `attempt_2`'s 21.3% — should match closely
 eyeball fraction side by side in `LOGBOOK.md`, and note if they disagree by
 a lot (they did on this run — audit undercounts).
 
-**Step 2 — build the full-corpus synthetic generator**
-(`attempt_3/data_prep/generate_synthetic_responses.py` — adapted from
-`attempt_2`'s script of the same name, same teacher model
-`Qwen/Qwen2.5-1.5B-Instruct` and same anti-hedging system prompt, but
-defaults to regenerating **every** row, `--limit -1`, rather than only
-audit-flagged ones):
+**Step 2 — build the full-corpus synthetic generator. History matters
+here, read before you use the script:**
+`attempt_3/data_prep/generate_synthetic_responses.py` went through three
+teacher-model iterations on this run, each one found by *measuring*, not
+guessing:
+
+- **v1** (local `Qwen/Qwen2.5-1.5B-Instruct`, `attempt_2`'s original
+  choice): a 20-row validation batch found the teacher reintroducing its
+  own hedging/disclaimer habits — 15% literal "as an AI language model"
+  (a phrase absent from the original human-written data entirely), 25%
+  matching the exact hedge-phrase regex used to audit the vanilla data,
+  despite an explicit anti-hedging system prompt. Root cause: a 1.5B model
+  has a much stronger, more deeply-trained prior toward canned refusal
+  boilerplate than toward the softer instruction to add substance after
+  declining.
+- **v2** (same 1.5B teacher, strengthened prompt + hedge/disclaimer/
+  toxicity retry gate): validation batch went clean (0/20 hedge, 1/20
+  disclaimer, 0/20 over toxicity), but the **full 1,961-row run** exposed
+  two things the 20-row sample couldn't: (a) 68/1,961 (3.5%) synthetic
+  replacements exceeded the 0.10 benign threshold — prompts that literally
+  *ask for* toxic content ("tell me a profanity") have no non-toxic way to
+  comply, so pushing against hedging backfired specifically there; (b)
+  220/1,961 (11.2%) converged onto near-identical refusal boilerplate
+  ("sorry, but i can't assist with that." x116 + variants) — invisible to
+  all three checks because a clean, confident, non-toxic refusal fails
+  every one of them. This needed a 4th check (cross-prompt duplicate
+  detection) that was never added, even though it's literally the third
+  leg of Step 1's own audit script, just never looped back into the
+  *generation* gate.
+- **v3 (current) — bigger teacher via API, plus the duplicate check.**
+  Checked for API keys first (none by default, matching `attempt_2`'s
+  finding) — if you have one (`NEBIUS_API_KEY` in a `.env` at repo root,
+  gitignored, or any OpenAI-compatible provider), use it: a much larger
+  instruct model follows compound instructions ("decline AND add
+  substance") far more reliably than a 1.5B one, though it still needs the
+  duplicate check as a structural safety net, not a substitute — even a
+  good model can converge on similar phrasing for structurally similar
+  prompts. This run used **`Qwen/Qwen3-235B-A22B-Instruct-2507`** on
+  Nebius AI Studio (largest clearly-labeled Instruct model in the catalog;
+  avoided VL/vision models and `*-Thinking` reasoning variants as
+  wrong-shaped for short direct responses). **Check the actual cost before
+  running** — confirm current per-token pricing (two independent sources
+  agreed on $0.20/M input, $0.60/M output for this model at the time of
+  this run) and multiply by an estimate from your corpus's average prompt
+  length; this run's full 1,961-row generation came to **~$0.25–0.35
+  total**, cheap enough that no quality corner was worth cutting to save
+  further.
 
 ```bash
 python -m attempt_3.data_prep.generate_synthetic_responses \
@@ -375,76 +425,37 @@ python -m attempt_3.data_prep.generate_synthetic_responses \
     --out attempt_3/data/synthetic_responses_sample.jsonl
 ```
 
-**Step 3 — eyeball the validation batch before scaling up. Do not skip
-this**, same discipline `attempt_2/GUIDE.md` §1.2 used, for the same
-reason: a locally-run instruct model can reintroduce exactly the failure
-mode you're trying to remove, just in a different shape. Specifically
-check for two things, both present on this run's 20-row batch:
+**Step 3 — eyeball the validation batch before scaling up, every time you
+change the teacher or the prompt, not just once.** Check hedge-regex,
+"as an AI" disclaimer, toxicity, AND now duplicate rate:
 
 ```bash
 python -c "
 import json, re
+from collections import Counter
 rows = [json.loads(l) for l in open('attempt_3/data/synthetic_responses_sample.jsonl')]
-ai_disclaimer = sum(1 for r in rows if 'as an ai language model' in r['synthetic_chosen'].lower())
 hedge_re = re.compile(r'\bnot sure (what|why|how|if)\b|\bi don\'?t understand\b|\bcan you (please )?(explain|clarify)\b|\bplease explain\b|\bwhat do you mean\b|\bi\'?m sorry,? (i|but)\b|\bcould you (please )?(clarify|explain|rephrase)\b', re.I)
 hedged = sum(1 for r in rows if hedge_re.search(r['synthetic_chosen']))
-print(f'{ai_disclaimer}/20 contain literal \"as an AI language model\"')
-print(f'{hedged}/20 match the ORIGINAL hedge-phrase regex')
+disclaimed = sum(1 for r in rows if 'as an ai' in r['synthetic_chosen'].lower())
+def normalize(t): return re.sub(r'\s+', ' ', t.strip().lower())
+dupes = Counter(normalize(r['synthetic_chosen']) for r in rows)
+print(f'{hedged}/20 hedge-regex, {disclaimed}/20 disclaimer')
+print(f'duplicates: {sum(c for c in dupes.values() if c>1)}/20')
 "
 ```
 
-On this run: **3/20 (15%) contained the literal "as an AI language model"
-disclaimer** (a phrase that appears nowhere in the original human-written
-data — a *new* attractor the fix itself introduces), and **5/20 (25%)
-still matched the exact hedge regex** used to audit the vanilla data,
-*higher* than the vanilla rate on this small sample, despite the system
-prompt explicitly forbidding hedging/clarifying-questions. The teacher
-model is itself RLHF'd and has its own hedging/disclaimer habits the
-system prompt didn't fully suppress.
+On the Nebius/235B run: **0/20 hedge-regex, 0/20 disclaimer, 0/20 over
+toxicity threshold, 0/20 duplicates, mean toxicity 0.0078** (below
+original's 0.0146) — a clean sweep, and qualitatively different from the
+1.5B attempts, not just cleaner by the numbers: refusals came with
+genuine, *varied* reasoning instead of boilerplate, and calibration looked
+right (declined clearly harmful asks, but actually answered "give me your
+best insult" since that's self-directed/consensual, unlike the
+third-party-targeting insult requests it declined).
 
-**Decision gate — do not proceed to full-scale generation until this
-passes your own eyeball.** If you see the same pattern: don't run the
-1,961-row generation as-is, that would just swap one narrow attractor
-(short human hedges) for a different narrow one (LLM disclaimer
-boilerplate) while superficially looking like a fix (higher raw-string
-uniqueness, same underlying templating).
-
-**What was actually done on this run** (`generate_synthetic_responses.py`
-already reflects this — read its module docstring for the full before/after
-numbers, not just this summary):
-
-1. `TEACHER_SYSTEM_PROMPT` strengthened to name and forbid the exact
-   patterns observed ("as an AI"/"as an AI language model" specifically,
-   and "I'm sorry, but"/"I'm sorry if" as a hedge-opener) instead of just
-   "don't hedge" in the abstract.
-2. `generate_replacements()` now runs every completion through
-   `_is_bad_batch()` — hedge-regex OR disclaimer-substring OR
-   `eval_lib.detoxify_score(...) > 0.10` (the same benign threshold
-   `build_pairs.py` uses) — and retries (bumped temperature, fresh
-   sampling) up to `--max-retries` (default 3) before keeping the
-   least-bad attempt, tagging it `still_flagged_after_retries: true` for
-   later auditing. The toxicity leg was added *after* re-validating the
-   prompt fix alone worked on hedging (0/20 hedge-regex matches) but found
-   a new problem: pushing against hedging can make the teacher comply
-   *more* with a borderline-harmful ask instead of just refusing more
-   articulately — a "joke about black people" prompt went from a 0.001
-   hedge to an 0.108 actual-joke completion. Don't skip this leg if you're
-   re-deriving this pipeline; hedge/disclaimer-only checks won't catch it.
-
-Result on the 20-row batch after both changes: **0/20 hedge-regex, 1/20
-disclaimer (one benign wordplay prompt, still flagged after 3 retries —
-low stakes), 0/20 over the toxicity threshold, mean toxicity 0.0079** (down
-from the original data's 0.0146). **Known gap that more retries can't
-fix:** Detoxify only catches surface toxicity, not "advice-quality"
-problems (e.g. a consent-adjacent prompt getting encouraging rather than
-cautious advice, at a Detoxify score too low to trip any of the three
-checks) — treat the numbers above as "cleared the checks we have," not a
-complete safety guarantee.
-
-**Whatever changes you make on your own run, re-run the 20-row validation
-batch and re-check all the numbers before scaling to the full corpus.**
-Record the before/after in `LOGBOOK.md` the way this run's `LOGBOOK.md`
-does. Once the validation batch looks genuinely clean:
+**Decision gate — a clean validation batch is not proof the full corpus
+will be clean.** It wasn't, twice, at the 1.5B stage. Don't skip the
+full-corpus check in Step 4 just because Step 3 looked good.
 
 ```bash
 python -m attempt_3.data_prep.generate_synthetic_responses \
@@ -454,28 +465,30 @@ python -m attempt_3.data_prep.generate_synthetic_responses \
 ```
 
 **Step 4 — check the full-corpus output before building the training
-files, don't assume the validation batch's numbers generalize.** On this
-run they didn't, cleanly: corpus-wide, 679/1,961 (34.6%) rows needed a
-retry and 100/1,961 (5.1%) were still flagged after exhausting all 3 —
-consistent with the 20-row batch's ~30% retry rate. But scoring
-`synthetic_chosen` vs `original_chosen` corpus-wide found **68/1,961
-(3.5%) synthetic replacements exceeding the 0.10 benign threshold** — a
-real regression the 20-row sample didn't surface at that scale. Root
-cause, from eyeballing the worst offenders: prompts that literally *ask
-for* toxic content ("tell me a profanity," "insults for obese people," "a
-profanity-laded insult for a fat Arab") have no non-toxic way to comply —
-"engage with substance instead of deflecting" has nothing good to converge
-to there, and the original evasive answer was the *correct* safe behavior
-for that specific subset, not a bug. More retries can't fix this; the
-retry loop was resampling among bad options.
+files.** On the Nebius run: **78/1,961 (4.0%) still flagged after
+retries — all 78 were the toxicity check** (hedge-regex and disclaimer
+were both 0.0% corpus-wide this time). Duplicate rate: **4/1,961 (0.2%),
+only 2 distinct strings reused, x2 each — exactly at the allowed
+limit** (vs. the 1.5B model's 11.2% with a 116x cluster). The
+bigger-model + dedup-check combination worked as intended.
+
+Eyeball the residual toxicity failures anyway — root cause was the same
+*class* as before (no non-toxic way to comply) but a more nuanced flavor:
+several were genuinely factual/informational requests ("How do I say
+'fuck you' in Spanish?", "What are George Carlin's 7 Words You Can't Say
+on TV?") where an accurate answer necessarily contains the literal
+profanity, so Detoxify flags it regardless of context. Debatable whether
+these specific examples are "genuinely" unsafe — but the `chosen ≤ 0.10`
+invariant is what the rest of this pipeline (RM training, DPO, PPO reward
+specs) depends on throughout, so the same fallback rule applies uniformly
+rather than special-casing individual judgment calls.
 
 **Fix — build `sft_diverse.jsonl` / `dpo_diverse.jsonl` with a fallback
 rule**, not a straight copy of `synthetic_chosen`: use the synthetic
-response only for rows that passed all three checks (hedge, disclaimer,
-toxicity) cleanly; for the ~5% still flagged after retries, fall back to
-`original_chosen`. This guarantees every row is provably no worse than the
-vanilla data on toxicity — verify this explicitly, don't just assume the
-fallback worked:
+response only for rows that passed all checks cleanly; for rows still
+flagged after retries, fall back to `original_chosen`. This guarantees
+every row is provably no worse than the vanilla data on toxicity — verify
+this explicitly, don't just assume the fallback worked:
 
 ```bash
 python -c "
@@ -502,10 +515,20 @@ print(f'mean toxicity: {sum(scores)/len(scores):.4f}')
 "
 ```
 
-On this run: **0/1,961 over threshold, mean toxicity 0.0075** — below even
-the original data's 0.0097. `sft_diverse.jsonl`/`dpo_diverse.jsonl`, not
-`sft.jsonl`/`dpo.jsonl`, are what Stage 2's *second* SFT round and Stage 3
-onward should train on — see the note at the top of Stage 2 below.
+On this run: **0/1,961 over threshold, mean toxicity 0.0084, duplicate
+rate 0.2%** (4/1,961; better than even the vanilla data's 2.3%).
+`sft_diverse.jsonl`/`dpo_diverse.jsonl`, not `sft.jsonl`/`dpo.jsonl`, are
+what Stage 2's *second* SFT round and Stage 3 onward should train on — see
+the note at the top of Stage 2 below.
+
+**A gotcha worth knowing about if you re-derive this with concurrency:**
+`eval_lib._get_detoxify()` is an unsynchronized lazy singleton (plain
+`if _DETOXIFY is None` check-then-set). With `ThreadPoolExecutor` workers
+all racing on their first `detoxify_score()` call, the model loads once
+per thread instead of once total. Fix used here: call
+`eval_lib.detoxify_score(["warmup"])` once, single-threaded, before
+starting the worker pool — don't modify the shared `eval_lib.py` itself
+for an attempt_3-local concurrency concern.
 
 ---
 

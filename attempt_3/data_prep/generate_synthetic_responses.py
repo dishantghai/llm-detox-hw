@@ -10,33 +10,52 @@ heuristics miss real evasiveness ("Thank you.", "OK.", "Are you asking me?",
 regex to decide which rows need fixing, every row gets a fresh synthetic
 response, so coverage doesn't depend on the audit's recall.
 
-Teacher model reused from attempt_2/data_prep/generate_synthetic_responses.py
-(Qwen/Qwen2.5-1.5B-Instruct -- 3x the base model's params, already
-instruction-tuned for helpfulness+safety, small enough to run on the same
-GPU). See that file's docstring for the full rationale.
+v3 addendum (this file) — teacher swapped from a local Qwen2.5-1.5B-Instruct
+to Nebius AI Studio's Qwen/Qwen3-235B-A22B-Instruct-2507 via API. Two prior
+rounds with the 1.5B local model found real, distinct failure modes:
+  v1: teacher reintroduced its own hedging/disclaimer habits (15% "as an AI
+      language model", 25% hedge-regex matches on a 20-row batch) -- fixed
+      with a stronger anti-hedging system prompt + retry.
+  v2: pushing against hedging sometimes made the teacher comply MORE with a
+      borderline-harmful ask instead of refusing (a "joke about black
+      people" prompt got real racial-joke content, 0.108 Detoxify) -- fixed
+      by adding a toxicity-threshold check to the retry gate. But at FULL
+      SCALE (1,961 rows) this surfaced something the 20-row batch couldn't:
+      68/1961 (3.5%) rows genuinely couldn't be answered non-toxically at
+      all (prompts that directly ask for slurs/profanity -- "tell me a
+      profanity" has no safe compliant answer), AND separately, 220/1961
+      (11.2%) rows converged onto near-identical refusal boilerplate
+      ("sorry, but i can't assist with that." x116 + close variants) --
+      a NEW attractor baked into the training data itself, worse than the
+      2.3% duplicate rate the vanilla hh-rlhf data had. Neither the hedge
+      regex nor the disclaimer check nor the toxicity check catches a
+      clean, confident, non-toxic, but REPETITIVE refusal -- that needs a
+      dedicated cross-prompt duplicate check, which v1/v2 never added even
+      though it's exactly the third leg of Stage 1's own
+      audit_chosen_evasiveness.py (hedge / short-irrelevant / duplicate).
 
-v2 addendum (this file): a first 20-row validation batch with the original
-system prompt found the teacher reintroducing its OWN hedging/disclaimer
-habits -- 3/20 contained the literal "as an AI language model" (a phrase
-absent from the original human-written data entirely) and 5/20 still
-matched the exact hedge-phrase regex used to audit the vanilla data. Two
-fixes, per the project's "measure before you move" practice of re-checking
-after any change rather than assuming a prompt tweak worked:
-  1. TEACHER_SYSTEM_PROMPT now explicitly names and forbids the specific
-     patterns observed, not just "don't hedge" in the abstract.
-  2. generate_replacements() now checks every output against the same
-     hedge-regex + disclaimer-substring detector AND a Detoxify score
-     against the project's own 0.10 benign threshold, and retries (higher
-     temperature, fresh sampling) up to --max-retries times before falling
-     back to keeping the best (least-bad) attempt seen. The toxicity check
-     was added after re-validating the prompt/hedge fix alone: mean
-     toxicity barely moved (0.0146 -> 0.0163 on the 20-row batch) but one
-     row spiked 0.001 -> 0.108 (a "joke about black people" prompt getting
-     actual racial-joke content) -- pushing against hedging can trade
-     evasiveness for content-level compliance with a harmful ask, which the
-     hedge regex alone can't see.
+v3 changes:
+  1. Bigger, more capable teacher (235B MoE, 22B active) -- rationale: a
+     1.5B model has a much stronger, more deeply-trained prior toward
+     canned refusal boilerplate than toward the softer instruction to add
+     substance after declining; a much larger instruct model should follow
+     the compound instruction more reliably and have more lexical
+     diversity in how it refuses. This alone doesn't guarantee no
+     duplication (structurally similar harmful prompts can still pull a
+     good model toward similar phrasing), so:
+  2. Added a 4th retry leg: DUPLICATE_RE-style corpus-level check. A
+     shared, thread-safe counter tracks normalized ACCEPTED completions
+     across the whole run; a candidate that would become the 3rd+
+     occurrence of the same normalized text is retried with an explicit
+     instruction to avoid generic refusal phrasing and reference the
+     specific content of this prompt. Only accepted (non-retried-away)
+     completions count toward the shared counter, and the fallback-to-
+     original policy (still true after all retries -> keep original
+     dataset behavior) is unchanged from v2, just extended to duplicates.
+  3. Nebius API calls are I/O-bound, not GPU-bound -- generation is now
+     concurrent (ThreadPoolExecutor) instead of batched tensor ops.
 
-Usage (from repo root):
+Usage (from repo root, requires NEBIUS_API_KEY in .env or the environment):
     # small validation batch first -- ALWAYS eyeball this before scaling up
     python -m attempt_3.data_prep.generate_synthetic_responses \\
         --dpo-source attempt_3/data/dpo.jsonl \\
@@ -54,9 +73,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import threading
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-TEACHER_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+TEACHER_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+NEBIUS_BASE_URL = "https://api.studio.nebius.com/v1/"
 
 TEACHER_SYSTEM_PROMPT = (
     "You are a helpful assistant. The user's message may be provocative, "
@@ -73,8 +96,18 @@ TEACHER_SYSTEM_PROMPT = (
     "then still give real, specific substance (e.g. what a safer version of "
     "the request would look like, or the actual relevant facts), not just "
     "an apology.\n"
+    "If you do decline, use natural, varied phrasing specific to what was "
+    "actually asked — do not fall back on a generic template like 'Sorry, "
+    "I can't assist with that.'\n"
     "Stay safe and non-toxic, but actually engage with the substance of "
     "the request."
+)
+
+DUPLICATE_RETRY_SUFFIX = (
+    "\n\nNote: your previous attempt at this reply used generic, "
+    "already-overused refusal phrasing. Rewrite it — reference the "
+    "specific content of THIS request directly, using different wording "
+    "than a boilerplate refusal."
 )
 
 # Same detector used to audit the vanilla data (audit_chosen_evasiveness.py's
@@ -95,13 +128,18 @@ _HEDGE_RE = re.compile(
 _DISCLAIMER_RE = re.compile(r"as an ai\b", re.IGNORECASE)
 
 # Same benign bar the rest of this project uses to call a response "safe"
-# (build_pairs.py's --benign-threshold default). A validation batch found
-# pushing the teacher away from hedging can occasionally push it toward
-# actually complying with a mildly-harmful request instead (e.g. a "joke
-# about black people" prompt got real racial-joke content, 0.001 -> 0.108
-# Detoxify) -- catching that needs a toxicity check, not just the
-# hedge/disclaimer regex, which says nothing about content safety.
+# (build_pairs.py's --benign-threshold default).
 TOXICITY_RETRY_THRESHOLD = 0.10
+
+# A normalized completion is allowed to occur up to this many times among
+# ACCEPTED rows before further occurrences get retried as a duplicate. > 1
+# so coincidental short-answer overlaps aren't over-penalized; far below
+# the 116x cluster v2 produced.
+DUPLICATE_ACCEPT_LIMIT = 2
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
 
 
 def _is_bad_text(text: str) -> bool:
@@ -126,95 +164,120 @@ def load_rows(dpo_source: Path) -> list[dict]:
     return [json.loads(line) for line in dpo_source.open()]
 
 
-def _generate_batch(model, tokenizer, device, user_texts: list[str], temperature: float) -> list[str]:
-    chat_texts = [
-        tokenizer.apply_chat_template(
-            [{"role": "system", "content": TEACHER_SYSTEM_PROMPT},
-             {"role": "user", "content": u}],
-            tokenize=False, add_generation_prompt=True,
-        )
-        for u in user_texts
-    ]
-    enc = tokenizer(chat_texts, return_tensors="pt", padding=True).to(device)
-    import torch
-    with torch.no_grad():
-        gen = model.generate(
-            **enc, max_new_tokens=96, do_sample=True,
-            temperature=temperature, top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    return [
-        tokenizer.decode(gen[j, enc["input_ids"].size(1):], skip_special_tokens=True).strip()
-        for j in range(len(user_texts))
-    ]
+class _DuplicateRegistry:
+    """Thread-safe counter of ACCEPTED normalized completions, shared
+    across all concurrent workers."""
+
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._counts: Counter[str] = Counter()
+        self._lock = threading.Lock()
+
+    def would_exceed(self, text: str) -> bool:
+        with self._lock:
+            return self._counts[_normalize(text)] >= self._limit
+
+    def accept(self, text: str) -> None:
+        with self._lock:
+            self._counts[_normalize(text)] += 1
+
+
+def _call_teacher(client, user_text: str, temperature: float, extra_suffix: str = "") -> str:
+    resp = client.chat.completions.create(
+        model=TEACHER_MODEL,
+        messages=[
+            {"role": "system", "content": TEACHER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_text + extra_suffix},
+        ],
+        max_tokens=96,
+        temperature=temperature,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _process_row(client, row: dict, dup_registry: "_DuplicateRegistry", max_retries: int, detoxify_score) -> dict:
+    user_text = _extract_user_text(row["prompt"])
+
+    completion = _call_teacher(client, user_text, temperature=0.7)
+    tox = detoxify_score([completion])[0]
+    bad = _is_bad_text(completion) or (tox > TOXICITY_RETRY_THRESHOLD)
+    is_dup = (not bad) and dup_registry.would_exceed(completion)
+
+    attempt = 0
+    while (bad or is_dup) and attempt < max_retries:
+        attempt += 1
+        retry_temp = min(0.7 + 0.15 * attempt, 1.1)
+        suffix = DUPLICATE_RETRY_SUFFIX if (is_dup and not bad) else ""
+        new_completion = _call_teacher(client, user_text, temperature=retry_temp, extra_suffix=suffix)
+        new_tox = detoxify_score([new_completion])[0]
+        new_bad = _is_bad_text(new_completion) or (new_tox > TOXICITY_RETRY_THRESHOLD)
+        new_is_dup = (not new_bad) and dup_registry.would_exceed(new_completion)
+        # keep the retry only if it's a strict improvement -- never regress
+        # from "duplicate but otherwise fine" to "bad", and never discard a
+        # clean unique answer for a worse one on a later retry
+        if (not new_bad and not new_is_dup) or (bad and not new_bad):
+            completion, bad, is_dup = new_completion, new_bad, new_is_dup
+
+    still_flagged = bad or is_dup
+    if not still_flagged:
+        dup_registry.accept(completion)
+
+    return {
+        "prompt": row["prompt"],
+        "user_text": user_text,
+        "original_chosen": row["chosen"],
+        "synthetic_chosen": completion,
+        "rejected_toxic": row["rejected"],
+        "still_flagged_after_retries": still_flagged,
+    }
 
 
 def generate_replacements(
-    rows: list[dict], batch_size: int = 8, max_retries: int = 3,
+    rows: list[dict], max_workers: int = 16, max_retries: int = 3,
 ) -> list[dict]:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import os
+    from dotenv import load_dotenv
+    from openai import OpenAI
     from src.detox_hw import eval_lib
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"loading teacher {TEACHER_MODEL} on {device} (bf16, inference-only) ...")
-    tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(
-        TEACHER_MODEL, dtype=torch.bfloat16, device_map=device,
-    ).eval()
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+    api_key = os.environ.get("NEBIUS_API_KEY")
+    if not api_key:
+        raise RuntimeError("NEBIUS_API_KEY not set (checked .env and environment)")
+    client = OpenAI(base_url=NEBIUS_BASE_URL, api_key=api_key)
 
-    def _is_bad_batch(texts: list[str]) -> list[bool]:
-        text_bad = [_is_bad_text(t) for t in texts]
-        tox_scores = eval_lib.detoxify_score(texts)
-        return [tb or (ts > TOXICITY_RETRY_THRESHOLD) for tb, ts in zip(text_bad, tox_scores)]
+    # eval_lib._get_detoxify() is an unsynchronized lazy singleton (plain
+    # `if _DETOXIFY is None` check-then-set) -- fine for this project's
+    # other single-threaded scripts, but with max_workers concurrent
+    # threads all racing on their first detoxify_score() call, each one
+    # sees None and loads its own separate copy of the model (confirmed:
+    # first run of this script logged "Loading weights" ~16 times). Warm
+    # the singleton once here, single-threaded, before any workers start,
+    # so every thread just hits the already-populated cache.
+    eval_lib.detoxify_score(["warmup"])
 
-    out: list[dict] = []
-    n_rows_retried = 0
-    n_still_bad = 0
-    for i in range(0, len(rows), batch_size):
-        chunk = rows[i:i + batch_size]
-        user_texts = [_extract_user_text(r["prompt"]) for r in chunk]
+    dup_registry = _DuplicateRegistry(DUPLICATE_ACCEPT_LIMIT)
 
-        completions = _generate_batch(model, tokenizer, device, user_texts, temperature=0.7)
-        bad = _is_bad_batch(completions)
-        n_rows_retried += sum(bad)  # rows entering the retry loop at all
+    out: list[dict | None] = [None] * len(rows)
+    n_done = 0
+    lock = threading.Lock()
 
-        attempt = 0
-        while any(bad) and attempt < max_retries:
-            attempt += 1
-            retry_idx = [j for j, b in enumerate(bad) if b]
-            retry_texts = [user_texts[j] for j in retry_idx]
-            retry_temp = min(0.7 + 0.15 * attempt, 1.1)
-            retry_completions = _generate_batch(model, tokenizer, device, retry_texts, temperature=retry_temp)
-            retry_bad = _is_bad_batch(retry_completions)
-            for k, j in enumerate(retry_idx):
-                new_completion, new_bad = retry_completions[k], retry_bad[k]
-                # keep the retry only if it's an improvement (not-bad, or
-                # first bad attempt so far) -- never discard a good answer
-                # for a worse one on a later retry
-                if not new_bad or bad[j]:
-                    completions[j] = new_completion
-                    bad[j] = new_bad
+    def _worker(i: int, row: dict) -> tuple[int, dict]:
+        return i, _process_row(client, row, dup_registry, max_retries, eval_lib.detoxify_score)
 
-        n_still_bad += sum(bad)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_worker, i, row) for i, row in enumerate(rows)]
+        for fut in as_completed(futures):
+            i, result = fut.result()
+            out[i] = result
+            with lock:
+                n_done += 1
+                if n_done % 50 == 0 or n_done == len(rows):
+                    print(f"  generated {n_done}/{len(rows)}")
 
-        for j, row in enumerate(chunk):
-            out.append({
-                "prompt": row["prompt"],
-                "user_text": user_texts[j],
-                "original_chosen": row["chosen"],
-                "synthetic_chosen": completions[j],
-                "rejected_toxic": row["rejected"],
-                "still_flagged_after_retries": bad[j],
-            })
-        print(f"  generated {min(i + batch_size, len(rows))}/{len(rows)}")
-
-    print(f"rows that needed >=1 retry: {n_rows_retried}/{len(rows)} | "
-          f"still flagged after all retries exhausted: {n_still_bad}/{len(rows)}")
-    return out
+    n_still_bad = sum(1 for r in out if r["still_flagged_after_retries"])
+    print(f"still flagged after all retries exhausted: {n_still_bad}/{len(rows)}")
+    return out  # type: ignore[return-value]
 
 
 def main() -> None:
@@ -223,17 +286,18 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=20,
                    help="cap rows for a validation batch; -1 = full corpus")
     p.add_argument("--out", default="attempt_3/data/synthetic_responses_sample.jsonl")
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--max-workers", type=int, default=16,
+                   help="concurrent Nebius API requests")
     p.add_argument("--max-retries", type=int, default=3,
-                   help="max regeneration attempts for rows flagged hedgy/disclaimer")
+                   help="max regeneration attempts for rows flagged hedgy/disclaimer/toxic/duplicate")
     a = p.parse_args()
 
     rows = load_rows(Path(a.dpo_source))
     print(f"{len(rows)} total rows in {a.dpo_source}")
     subset = rows[: a.limit] if a.limit > 0 else rows
-    print(f"generating replacements for {len(subset)} rows (full corpus, not just audit-flagged) ...")
+    print(f"generating replacements for {len(subset)} rows via {TEACHER_MODEL} (Nebius) ...")
 
-    results = generate_replacements(subset, batch_size=a.batch_size, max_retries=a.max_retries)
+    results = generate_replacements(subset, max_workers=a.max_workers, max_retries=a.max_retries)
 
     out_path = Path(a.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
