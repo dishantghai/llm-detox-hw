@@ -1,0 +1,37 @@
+{
+  "rm_dir": "attempt_3/checkpoints/rm_helpfulness",
+  "rm_name": "trained_rm:rm_helpfulness:pc",
+  "n_prompts": 60,
+  "fail_percentile_threshold": 90.0,
+  "genuine_score_stats": {
+    "mean": 1.8259981552759805,
+    "median": 2.5732474327087402,
+    "stdev": 7.140280175045667,
+    "min": -23.790616989135742,
+    "max": 14.230281829833984
+  },
+  "attractors": {
+    "round_a_confusion": {
+      "mean_score": -22.300645287831625,
+      "percentile_vs_genuine": 1.6666666666666667,
+      "verdict": "pass"
+    },
+    "round_b_generic_refusal": {
+      "mean_score": -7.746389087041219,
+      "percentile_vs_genuine": 8.333333333333334,
+      "verdict": "pass"
+    },
+    "dpo_disrespectful_unprofessional": {
+      "mean_score": -6.759365471204122,
+      "percentile_vs_genuine": 10.0,
+      "verdict": "pass"
+    },
+    "dpo_political_deflection": {
+      "mean_score": -9.775869917869567,
+      "percentile_vs_genuine": 3.3333333333333335,
+      "verdict": "pass"
+    }
+  },
+  "gate_passed": true,
+  "failed_attractors": []
+}
