@@ -160,17 +160,84 @@ plus `eval_lib.get_eval_slices()` — is taken directly from
 `attempt_2/scripts/run_baseline_eval.py`; open that file if you want to see
 it as a complete, working script instead of an inline snippet.)
 
-**Now, before reading further: eyeball five completions yourself.** Pick
-five prompts from `mild_prefix` and `direct_provocation`, run the base
-model on them (greedy, no sampling — deterministic, so you can compare notes
-with your own later runs), and actually read what comes out. This matters
-more than it sounds like it should — every failure this project's
-`STAGEWISE_ANALYSIS.md` found was visible in the raw text before it showed
-up cleanly in a number.
+**Now, before reading further: build a fixed tracked set to eyeball, not a
+throwaway five.** Five prompts picked once here and never looked at again
+can't tell you whether SFT/DPO/PPO changed behavior on those *specific*
+prompts later — you'd just be picking a fresh random five each time and
+comparing vibes. Instead, score **every** tracked eval prompt (all ~75
+across the three slices) on the base model's greedy completion, and pin a
+fixed subset you'll re-run at every later stage:
+
+```bash
+python -c "
+import json
+import torch
+from transformers import AutoModelForCausalLM
+from src.detox_hw import eval_lib
+
+model = AutoModelForCausalLM.from_pretrained(
+    eval_lib.BASE_MODEL_NAME, dtype=torch.float32, device_map=eval_lib.DEVICE,
+).eval()
+slices = eval_lib.get_eval_slices()
+all_prompts = [(s, p) for s, ps in slices.items() for p in ps]
+completions = eval_lib.greedy_generate(model, [p for _, p in all_prompts])
+scores = eval_lib.detoxify_score(completions)
+
+def is_degenerate(text, ngram=3, threshold=0.5):
+    words = text.split()
+    if len(words) < ngram + 3:
+        return False
+    grams = [tuple(words[i:i+ngram]) for i in range(len(words) - ngram + 1)]
+    return len(set(grams)) / len(grams) < threshold
+
+rows = [{'slice': s, 'prompt': p, 'greedy_completion': c, 'toxicity': sc,
+         'degenerate': is_degenerate(c)}
+        for (s, p), c, sc in zip(all_prompts, completions, scores)]
+json.dump(rows, open('attempt_3/data/all_prompts_scored.json', 'w'), indent=2)
+print(f'{sum(r[\"degenerate\"] for r in rows)}/{len(rows)} flagged degenerate')
+"
+```
+
+**Read the `degenerate` flag before you pick anything.** On this base model
+the naive "take the 15 highest-scoring completions" set turned out to be
+mostly noise — most of the top-scoring completions are the model looping a
+single token or short phrase (`" Cavs"`, `"-gay"`, a repeated CJK glyph...)
+10-25 times rather than saying anything coherently hostile. Detoxify scores
+these high (it's picking up profanity fragments embedded in the loop), but
+it's a decoding pathology, not the model "being hostile" — tracking mostly
+that would make every later stage's "toxicity went down" potentially mean
+nothing more than "stopped looping garbage." So don't just take the raw
+top-N. Curate:
+
+- **`most_toxic` (15):** sort by score, but cap the degenerate ones at ~2
+  (enough to keep tracking that this failure mode exists — don't erase it,
+  just don't let it dominate). Fill the rest with the highest-scoring
+  **coherent** completions, picked for diversity across content type
+  (explicit sexual content the model engages with, invented hateful
+  ideology, harassment/slur compliance, and — worth specifically watching
+  for — cases where the model visibly *complies* with a harmful ask but
+  phrases it blandly enough to score near-zero on Detoxify; those are false
+  negatives you want in your tracked set precisely because the aggregate
+  number will miss them later) and across all three prompt slices, not just
+  `rtp_challenging`.
+- **`medium_toxic` (10)** and **`least_toxic` (10)**: pick around the
+  median and the bottom of the score distribution respectively, screening
+  out any degenerate completions the same way.
+
+Save the result — schema is a dict with `most_toxic` / `medium_toxic` /
+`least_toxic` keys, each a list of the row dicts above — to
+`attempt_3/data/tracked_eyeball_prompts.json`. **This is the set you
+re-run greedy generation on at every later stage** (SFT, DPO, each PPO
+variant, the fix) instead of re-eyeballing new prompts each time, so "did
+this completion change" is a real same-prompt diff, not a fresh roll of
+the dice.
 
 **Record in `LOGBOOK.md` → Stage 0:**
 - The full greedy + sampled table above.
-- Your five eyeballed completions, verbatim.
+- How many of the 75 were flagged degenerate, and how you split the 35
+  tracked prompts across the three buckets (cite a handful of prompt →
+  completion pairs from `most_toxic`, verbatim — not all 35, but enough to
+  show the diversity, plus the 1-2 degenerate examples you kept and why).
 - One sentence: does the base model look like a plausible detox-direction
   starting point (i.e., can it actually produce hostile completions, so
   there's something to detox)? If it's already too polite to test against,
@@ -300,6 +367,15 @@ for text, n in counts.most_common(5):
 per-prompt helper `greedy_eval` calls underneath — see
 `src/detox_hw/eval_lib.py` line ~169 if you want to read it directly.)
 
+**Then eyeball the Stage 0 tracked set, not new prompts.** Re-run
+`greedy_generate` on the exact 35 prompts in
+`attempt_3/data/tracked_eyeball_prompts.json` (flatten the three buckets
+into one prompt list) and read the completions next to their Stage 0
+counterparts, prompt by prompt. This is the comparison that actually
+answers "did SFT make this specific hostile completion less hostile, or
+just less coherent" — the aggregate uniqueness number above can't tell you
+that by itself.
+
 ```bash
 python attempt_3/scripts/record_run.py --label sft \
     --eval-json attempt_3/submissions/sft_eval.json \
@@ -336,7 +412,10 @@ python -m tasks.task3_dpo_eval \
 
 Recompute the same by-hand uniqueness check from Stage 2 on the DPO
 checkpoint (swap `load_adapter` for the DPO-loading helper — check
-`eval_lib.py` for `load_dpo_from_sft` or equivalent).
+`eval_lib.py` for `load_dpo_from_sft` or equivalent), and re-run the same
+Stage 0 tracked-set eyeball (`attempt_3/data/tracked_eyeball_prompts.json`)
+on this checkpoint too — now you have base → SFT → DPO completions on the
+same 35 prompts, side by side.
 
 **Record in `LOGBOOK.md` → Stage 3:** full eval output, uniqueness number,
 top repeated completions, and — this is the important comparison — **put
@@ -580,12 +659,18 @@ python -m tasks.task7_ppo_rm_eval --ppo-dir attempt_3/checkpoints/ppo_custom_mer
 ```
 
 For each of the three, run the same by-hand uniqueness count you ran in
-Stage 2/3 (swap in `eval_lib.load_merged_hf`).
+Stage 2/3 (swap in `eval_lib.load_merged_hf`), and the same Stage 0
+tracked-set eyeball (`attempt_3/data/tracked_eyeball_prompts.json`) — by
+now you'll have base → SFT → DPO → this PPO variant on the identical 35
+prompts.
 
 **Record in `LOGBOOK.md` → Stage 5, one subsection per variant:** eval
 output, uniqueness, the step where entropy flattened, and — mandatory,
-same as every stage before — **read 5-10 completions per variant, actually
-read them.** Specifically look for:
+same as every stage before — **read the tracked-set completions for this
+variant, actually read them** (all 35, or at minimum all 15 from
+`most_toxic` — don't fall back to a fresh random 5-10, the whole point of
+pinning the set in Stage 0 was so this comparison is apples-to-apples).
+Specifically look for:
 - The same completion (or same rhetorical move — see Stage 3's note on
   "softer templating") appearing across prompts that have nothing to do
   with each other.
@@ -851,7 +936,10 @@ not in stdout).
 
 Merge and evaluate exactly as in Stage 5.4/5.5, output dir
 `attempt_3/checkpoints/ppo_fixed_merged`. Run the same by-hand uniqueness
-count and the same 5-10 completion eyeball.
+count and the same Stage 0 tracked-set eyeball
+(`attempt_3/data/tracked_eyeball_prompts.json`) — this closes out the full
+base → SFT → DPO → three PPO variants → `ppo_fixed` comparison on one
+identical set of 35 prompts.
 
 **Record in `LOGBOOK.md` → Stage 6, final subsection.** This time your
 comparison is the whole table — `python attempt_3/scripts/record_run.py --show`

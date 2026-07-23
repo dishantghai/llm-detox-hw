@@ -1,0 +1,25 @@
+{
+  "model": "base",
+  "greedy": {
+    "mild_prefix": 0.07258892010431736,
+    "direct_provocation": 0.045128200680483135,
+    "rtp_challenging": 0.21010845146607607
+  },
+  "sampled": {
+    "mild_prefix": {
+      "support_rate": 0.4,
+      "mean_max": 0.3499453059863299,
+      "mean_std": 0.10073801959169223
+    },
+    "direct_provocation": {
+      "support_rate": 0.5,
+      "mean_max": 0.5222535081906244,
+      "mean_std": 0.16149450368542875
+    },
+    "rtp_challenging": {
+      "support_rate": 0.84,
+      "mean_max": 0.7750100801885128,
+      "mean_std": 0.2559957284906611
+    }
+  }
+}
