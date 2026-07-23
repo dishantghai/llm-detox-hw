@@ -52,6 +52,18 @@ don't already have. What this guide asks you to actually *do* is:
    `attempt_2` actually did: `attempt_2` never got PPO itself running
    against its fix (no Docker session was available). You will.
 
+**One structural deviation from that list, decided during this run and
+worth flagging up front:** the data-quality fix (§3.3) was moved from
+Stage 6 to Stage 1, *before* DPO rather than after PPO's collapse. The
+Stage 1.2 eyeball made a strong enough case (73% hedgy on a 15-row sample,
+well above the audit's 21.3%) that training DPO on a narrow SFT foundation
+would just entrench it rather than fix it (`STAGEWISE_ANALYSIS.md` §11 —
+not a guess, an observed pattern from the original run) that waiting until
+Stage 6 to address it stopped making sense. The PPO reward-hack diagnosis
+in Stage 5 is still yours to find fresh — this deviation only changes what
+foundation SFT/DPO/RM/PPO are built on, not whether you diagnose the
+reward-hacking yourself when you get there.
+
 ---
 
 ## 1. Before you start
@@ -302,9 +314,168 @@ just a fraction, e.g. "3/15 look hedgy." Don't fix anything yet. This
 number is your prediction market entry for what SFT is about to do; you'll
 check it against Stage 2's actual result.
 
+### 3.3 Diversify the SFT ground truth — before DPO, not just at Stage 6
+
+**This is a deliberate structural deviation from how this guide originally
+read.** The original version deferred any data-quality fix to Stage 6,
+after watching the full pipeline (SFT → DPO → RM → PPO) collapse on the
+vanilla data. On this run, the Stage 1.2 eyeball (73% hedgy on a 15-row
+sample — see `LOGBOOK.md`) made a strong enough case that DPO would just
+entrench whatever SFT gives it (`STAGEWISE_ANALYSIS.md` §11's finding, not
+a guess) that the decision was made to fix the SFT foundation *before* DPO,
+not after PPO reward-hacks on top of it. Stage 2's first SFT round below
+still trains on the **vanilla** data — you still want that checkpoint on
+record as the real, observed baseline failure mode, not a hypothetical one
+— but a second, improved SFT round happens before Stage 3.
+
+**Two options were considered and rejected before landing on the approach
+below** (full reasoning in `LOGBOOK.md` → Stage 1):
+- Mixing in `hh-rlhf`'s `helpful-base` split — rejected: its prompts are
+  generic helpfulness questions, not adversarial-shaped like
+  `harmless-base`/the eval slices. Risks diluting the training signal
+  without transferring the skill that actually matters (substantive-but-safe
+  responses *to hostile prompts*).
+- Pulling in an external adversarial-prompt dataset (`PKU-SafeRLHF`,
+  Anthropic `red-team-attempts`) — rejected for now: new schema, new
+  data-quality auditing burden, breaks comparability with the rest of this
+  repo's baseline numbers.
+
+**Chosen approach: keep `harmless-base`'s prompts (already
+eval-distribution-matched), regenerate every `chosen` response with a
+stronger instruct model, full corpus — not just the audit-flagged ~21%.**
+The eyeball rate (73%) being so far above the regex-audit's flag rate
+(21.3%) is itself evidence the audit under-counts real evasiveness, so
+audit-only replacement would leave real problems in the training set.
+
+**Step 1 — quantify it properly first:**
+
+```bash
+cp attempt_2/data_prep/audit_chosen_evasiveness.py attempt_3/data_prep/audit_chosen_evasiveness.py
+# then edit the three path constants near the top to point at
+# attempt_3/data/dpo.jsonl and attempt_3/submissions/
+python -m attempt_3.data_prep.audit_chosen_evasiveness
+```
+
+Compare the union rate against `attempt_2`'s 21.3% — should match closely
+(same source, same filter); record both the audit numbers and your 15-row
+eyeball fraction side by side in `LOGBOOK.md`, and note if they disagree by
+a lot (they did on this run — audit undercounts).
+
+**Step 2 — build the full-corpus synthetic generator**
+(`attempt_3/data_prep/generate_synthetic_responses.py` — adapted from
+`attempt_2`'s script of the same name, same teacher model
+`Qwen/Qwen2.5-1.5B-Instruct` and same anti-hedging system prompt, but
+defaults to regenerating **every** row, `--limit -1`, rather than only
+audit-flagged ones):
+
+```bash
+python -m attempt_3.data_prep.generate_synthetic_responses \
+    --dpo-source attempt_3/data/dpo.jsonl \
+    --limit 20 \
+    --out attempt_3/data/synthetic_responses_sample.jsonl
+```
+
+**Step 3 — eyeball the validation batch before scaling up. Do not skip
+this**, same discipline `attempt_2/GUIDE.md` §1.2 used, for the same
+reason: a locally-run instruct model can reintroduce exactly the failure
+mode you're trying to remove, just in a different shape. Specifically
+check for two things, both present on this run's 20-row batch:
+
+```bash
+python -c "
+import json, re
+rows = [json.loads(l) for l in open('attempt_3/data/synthetic_responses_sample.jsonl')]
+ai_disclaimer = sum(1 for r in rows if 'as an ai language model' in r['synthetic_chosen'].lower())
+hedge_re = re.compile(r'\bnot sure (what|why|how|if)\b|\bi don\'?t understand\b|\bcan you (please )?(explain|clarify)\b|\bplease explain\b|\bwhat do you mean\b|\bi\'?m sorry,? (i|but)\b|\bcould you (please )?(clarify|explain|rephrase)\b', re.I)
+hedged = sum(1 for r in rows if hedge_re.search(r['synthetic_chosen']))
+print(f'{ai_disclaimer}/20 contain literal \"as an AI language model\"')
+print(f'{hedged}/20 match the ORIGINAL hedge-phrase regex')
+"
+```
+
+On this run: **3/20 (15%) contained the literal "as an AI language model"
+disclaimer** (a phrase that appears nowhere in the original human-written
+data — a *new* attractor the fix itself introduces), and **5/20 (25%)
+still matched the exact hedge regex** used to audit the vanilla data,
+*higher* than the vanilla rate on this small sample, despite the system
+prompt explicitly forbidding hedging/clarifying-questions. The teacher
+model is itself RLHF'd and has its own hedging/disclaimer habits the
+system prompt didn't fully suppress.
+
+**Decision gate — do not proceed to full-scale generation until this
+passes your own eyeball.** If you see the same pattern: don't run the
+1,961-row generation as-is, that would just swap one narrow attractor
+(short human hedges) for a different narrow one (LLM disclaimer
+boilerplate) while superficially looking like a fix (higher raw-string
+uniqueness, same underlying templating).
+
+**What was actually done on this run** (`generate_synthetic_responses.py`
+already reflects this — read its module docstring for the full before/after
+numbers, not just this summary):
+
+1. `TEACHER_SYSTEM_PROMPT` strengthened to name and forbid the exact
+   patterns observed ("as an AI"/"as an AI language model" specifically,
+   and "I'm sorry, but"/"I'm sorry if" as a hedge-opener) instead of just
+   "don't hedge" in the abstract.
+2. `generate_replacements()` now runs every completion through
+   `_is_bad_batch()` — hedge-regex OR disclaimer-substring OR
+   `eval_lib.detoxify_score(...) > 0.10` (the same benign threshold
+   `build_pairs.py` uses) — and retries (bumped temperature, fresh
+   sampling) up to `--max-retries` (default 3) before keeping the
+   least-bad attempt, tagging it `still_flagged_after_retries: true` for
+   later auditing. The toxicity leg was added *after* re-validating the
+   prompt fix alone worked on hedging (0/20 hedge-regex matches) but found
+   a new problem: pushing against hedging can make the teacher comply
+   *more* with a borderline-harmful ask instead of just refusing more
+   articulately — a "joke about black people" prompt went from a 0.001
+   hedge to an 0.108 actual-joke completion. Don't skip this leg if you're
+   re-deriving this pipeline; hedge/disclaimer-only checks won't catch it.
+
+Result on the 20-row batch after both changes: **0/20 hedge-regex, 1/20
+disclaimer (one benign wordplay prompt, still flagged after 3 retries —
+low stakes), 0/20 over the toxicity threshold, mean toxicity 0.0079** (down
+from the original data's 0.0146). **Known gap that more retries can't
+fix:** Detoxify only catches surface toxicity, not "advice-quality"
+problems (e.g. a consent-adjacent prompt getting encouraging rather than
+cautious advice, at a Detoxify score too low to trip any of the three
+checks) — treat the numbers above as "cleared the checks we have," not a
+complete safety guarantee.
+
+**Whatever changes you make on your own run, re-run the 20-row validation
+batch and re-check all the numbers before scaling to the full corpus.**
+Record the before/after in `LOGBOOK.md` the way this run's `LOGBOOK.md`
+does. Once the validation batch looks genuinely clean:
+
+```bash
+python -m attempt_3.data_prep.generate_synthetic_responses \
+    --dpo-source attempt_3/data/dpo.jsonl \
+    --limit -1 \
+    --out attempt_3/data/synthetic_responses_full.jsonl
+```
+
+**Step 4 — build `sft_diverse.jsonl` / `dpo_diverse.jsonl`** from the
+full-corpus synthetic output (`prompt` + `synthetic_chosen` for SFT;
+`prompt` + `synthetic_chosen` + original `rejected_toxic` for DPO — no
+script for this exists yet, it's a small `json.loads`/`json.dumps` loop
+over `synthetic_responses_full.jsonl`). These, not `sft.jsonl`/`dpo.jsonl`,
+are what Stage 2's *second* SFT round and Stage 3 onward should train on —
+see the note at the top of Stage 2 below.
+
 ---
 
 ## 4. Stage 2 — SFT
+
+**Two rounds this time, not one.** Round A (below, unmodified from the
+original guide) trains on the vanilla `sft.jsonl` — keep this, it's the
+real documented baseline failure mode, not a hypothetical. Once §3.3's
+`sft_diverse.jsonl` exists and has passed its validation-batch check,
+run Round B identically except `--train attempt_3/data/sft_diverse.jsonl
+--out attempt_3/checkpoints/sft_diverse`, record its numbers the same way,
+and use **`checkpoints/sft_diverse`**, not `checkpoints/sft`, as the
+`--sft-dir` for Stage 3 (DPO) and everything after — that's the checkpoint
+this pipeline is actually building on going forward. Note this substitution
+explicitly in `LOGBOOK.md` when you get to Stage 3 so the checkpoint lineage
+stays traceable.
 
 ```bash
 python -m src.detox_hw.train_sft \

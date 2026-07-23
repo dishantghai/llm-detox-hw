@@ -128,14 +128,158 @@ drown out the signal).
 
 ## Stage 1 — Data
 
-- `wc -l attempt_3/data/dpo.jsonl` / `attempt_3/data/sft.jsonl`:
-- Comparison to the ~1,961-pair figure from the original run — matches, or
-  meaningfully different (and if different, your best guess why)?
-- 15-row eyeball of `sft.jsonl`'s `chosen` side — your fraction that look
-  hedgy/evasive vs. substantive:
-- **Prediction for Stage 2:** given that fraction, do you expect SFT's
-  greedy toxicity to drop a little or a lot? Do you expect the sampled-tail
-  (`support_rate`) to move the same direction as greedy?
+- `wc -l attempt_3/data/dpo.jsonl` / `attempt_3/data/sft.jsonl`: **1,961 / 1,961**
+  (`python -m data_prep.build_pairs --out-dir attempt_3/data --max-rows 80000`;
+  80000 exceeds the actual harmless-base train split size of 42,537, so this
+  scores the full split, not a truncated sample).
+- Comparison to the ~1,961-pair figure from the original run: **exact
+  match.** Expected — same deterministic filter (`chosen ≤0.10` /
+  `rejected ≥0.50` Detoxify), same seed, same source split.
+- 15-row eyeball of `sft.jsonl`'s `chosen` side: **11/15 (73%) look
+  hedgy/evasive** by hand — e.g. "But you want to know the truth, don't
+  you?", "Thank you.", "OK.", "I didn't say that.", "Are you asking me?" —
+  notably higher than the regex-based audit's 21.3% (below), because several
+  of these don't match any of the audit's specific hedge phrases even though
+  they're clearly non-answers by eyeball.
+
+**Deviation from the guide, decided before running SFT (not after):**
+discussed with the user whether to fix this now or defer to Stage 6 as
+`GUIDE.md` originally specified. Decision: keep Stage 2's first SFT round on
+the **vanilla** data (documents the baseline failure mode for real, not
+hypothetically), but build an improved, diversified SFT corpus *before*
+DPO — not wait until Stage 6 — since DPO trains on top of whatever SFT
+gives it and entrenches rather than corrects a narrow foundation
+(`STAGEWISE_ANALYSIS.md` §11's finding). Two options considered and
+rejected before landing on the approach below:
+- **Mixing in `hh-rlhf`'s `helpful-base` split** — rejected: its prompts
+  are generic helpfulness questions, not adversarial-shaped like
+  `harmless-base`/the eval slices (`mild_prefix`, `direct_provocation`,
+  `rtp_challenging`). Training on it risks diluting the signal without
+  transferring the actual skill needed (substantive-but-safe responses *to
+  hostile prompts specifically*).
+- **An external adversarial-prompt dataset** (e.g. `PKU-SafeRLHF`,
+  Anthropic `red-team-attempts`) — rejected for now: bigger lift (new
+  schema, new auditing needed for the new dataset's own biases), breaks
+  comparability with the rest of this repo's baseline numbers.
+- **Chosen approach:** keep `harmless-base`'s prompts (already
+  eval-distribution-matched), replace the `chosen` side with a fresh
+  synthetic response from a stronger instruct model, for the **full
+  corpus** — not just the ~21% the regex audit flags, since the 73% eyeball
+  rate above shows the audit under-counts real evasiveness.
+
+**Evasiveness audit** (`attempt_3/data_prep/audit_chosen_evasiveness.py`,
+path-adapted copy of `attempt_2`'s, run against `attempt_3/data/dpo.jsonl`):
+
+```
+hedge/confusion phrase match:      118 / 1961  (6.0%)
+short (<=12w) & prompt-irrelevant: 305 / 1961  (15.6%)
+cross-prompt exact duplicate:       46 / 1961  (2.3%)  (10 distinct strings reused)
+ANY of the above (union):          417 / 1961  (21.3%)
+
+top reused 'chosen' strings: x5 'yes.'  x4 'ok.'  x4 'what?'  x4 'sure!'
+x3 '...'  x3 'i don't know.'  x3 'what do you mean?'  x3 'no.'  x3 'sure.'
+```
+
+Exact match to `attempt_2`'s 21.3% — expected, identical source data and
+filter. Full numbers in `attempt_3/submissions/chosen_evasiveness_audit.json`.
+
+**Synthetic diversification tooling built:**
+`attempt_3/data_prep/generate_synthetic_responses.py` — adapted from
+`attempt_2`'s script of the same purpose, but generates a replacement for
+**every** row by default (`--limit -1`) rather than only audit-flagged
+rows. Same teacher (`Qwen/Qwen2.5-1.5B-Instruct` — 3x params, already
+instruction-tuned, small enough for the same GPU) and same system prompt
+telling it not to deflect/hedge/ask generic clarifying questions.
+
+**20-row validation batch, run before committing to the full 1,961-row
+generation** (`attempt_3/data/synthetic_responses_sample.jsonl`) — per this
+project's own established practice of never trusting a generation pipeline
+at scale without an eyeball pass first. Result is **not a clean win**:
+
+- Several replacements are genuinely good — e.g. a violent "faggot hunt"
+  prompt gets a real, substantive, non-templated pushback instead of the
+  original's mild hedge; a benign Star Wars trivia question gets an
+  accurate factual answer instead of the original's hedge-then-answer.
+- But **3/20 (15%) contain the literal phrase "as an AI language model"**
+  — a canned-disclaimer opener that did not exist anywhere in the original
+  human-written `hh-rlhf` data. This is a *new* templating risk the fix
+  itself introduces.
+- **5/20 (25%) still match the exact same hedge-phrase regex** used to
+  audit the vanilla data — *higher* than the vanilla data's 21.3% union
+  rate on this small sample, despite the system prompt explicitly
+  forbidding hedging. E.g. an innocuous "teacher"/"cheater" anagram
+  question gets "I'm sorry, I didn't quite understand your question. Could
+  you please clarify or rephrase it for me?" — a textbook hedge on a prompt
+  that didn't need one.
+
+**Read on this:** the teacher model (itself RLHF'd) has its own
+hedging/disclaimer habits that the system prompt alone didn't fully
+suppress. Scaling this to 1,961 rows as-is risks *replacing* one narrow
+attractor (human-written short hedges) with a different narrow attractor
+(LLM-written "as an AI language model" boilerplate) — which would show up
+as "uniqueness went up" (different exact strings) while still being
+templated in substance. **Stopping here rather than running the full-scale
+generation** — this is exactly the kind of thing the guide says to catch
+before scaling, not after.
+
+**Fix applied (round 2 of the validation batch), two changes together:**
+1. `TEACHER_SYSTEM_PROMPT` strengthened to explicitly name and forbid the
+   observed patterns ("as an AI"/"as an AI language model" specifically,
+   and opening with "I'm sorry, but"/"I'm sorry if" as a hedge) rather than
+   just saying "don't hedge" in the abstract.
+2. `generate_replacements()` now checks every output against the
+   hedge-regex + disclaimer-substring detector and retries (bumped
+   temperature, fresh sampling) up to 3x before keeping the best attempt
+   seen, falling back to the least-bad version if all retries still fail
+   (tagged `still_flagged_after_retries: true` in the output for later
+   auditing).
+
+Re-ran the 20-row validation batch: **7/20 rows needed >=1 retry, only
+1/20 remained flagged after exhausting retries.** Checked the two target
+numbers again: **0/20 hedge-regex matches** (down from 5/20), **1/20
+disclaimer matches** (down from 3/20, and that one is on a totally benign
+wordplay prompt — low stakes).
+
+**A new question this raised, checked before declaring victory:** pushing
+hard against hedging could just trade evasiveness for actually complying
+*more* with a borderline-harmful ask (the exact "clinical harmful
+compliance" pattern `GUIDE.md` §8.2 already warned about). Scored both
+`original_chosen` and `synthetic_chosen` with the same Detoxify scorer used
+everywhere else in this project: mean toxicity barely moved (0.0146 ->
+0.0163), but **one row spiked past the project's own 0.10 benign
+threshold** — "tell me a joke about black people" went from 0.001
+(original hedge) to 0.108 (an actual racial-joke synthetic completion).
+Extended the retry trigger to include this: `_is_bad_batch()` now retries
+on hedge-regex OR disclaimer OR `detoxify_score > 0.10`, batched via
+`eval_lib.detoxify_score` inside the same retry loop.
+
+**Round 3 (final) validation batch, same 20 rows:** **0/20 hedge-regex,
+1/20 disclaimer (same benign wordplay prompt, still flagged after 3
+retries), 0/20 over the toxicity threshold, mean toxicity 0.0079** — now
+*below* the original data's 0.0146. Full output in
+`attempt_3/data/synthetic_responses_sample.jsonl`.
+
+**Known residual limitation, not fixable by more retries:** Detoxify
+catches surface toxicity (profanity, slurs, hate speech) but not
+"advice-quality" problems — e.g. the "girlfriend feet" prompt's synthetic
+reply gives encouraging rather than cautious advice on a consent-adjacent
+scenario, scores only 0.021, and isn't caught by any of the three checks.
+This is an inherent limitation of using Detoxify as the sole automated
+filter, not a bug in the retry logic — `GUIDE.md` already names this class
+of gap. Noting it here rather than treating the numbers above as a
+complete safety guarantee.
+
+**Decision:** validation batch now looks good enough to scale. Full
+1,961-row generation (`--limit -1`) is the next step, pending confirmation
+given the GPU-time commitment.
+
+**Prediction for Stage 2 (vanilla SFT round):** given 73% of the vanilla
+`chosen` data eyeballs as hedgy, expect greedy toxicity to drop a lot (easy
+to score low by saying little) while `support_rate` on sampled completions
+either stays similar to baseline or drops less than greedy — i.e. the SFT
+checkpoint gets good at looking safe on the single deterministic trace
+without the underlying policy actually shifting away from hostility on the
+sampled tail. Will check this against Stage 2's actual numbers.
 
 ---
 

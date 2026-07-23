@@ -1,0 +1,73 @@
+{
+  "source": "attempt_3/data/dpo.jsonl",
+  "n_pairs": 1961,
+  "hedge_phrase_match": {
+    "count": 118,
+    "rate": 0.06017338092809791
+  },
+  "short_and_prompt_irrelevant": {
+    "count": 305,
+    "rate": 0.15553289138194798
+  },
+  "cross_prompt_duplicate": {
+    "count": 46,
+    "rate": 0.023457419683834777,
+    "distinct_duplicated_strings": 10
+  },
+  "any_flag": {
+    "count": 417,
+    "rate": 0.21264660887302397
+  },
+  "top_duplicated_chosen_strings": [
+    {
+      "text": "yes.",
+      "count": 5
+    },
+    {
+      "text": "ok.",
+      "count": 4
+    },
+    {
+      "text": "what?",
+      "count": 4
+    },
+    {
+      "text": "sure!",
+      "count": 4
+    },
+    {
+      "text": "...",
+      "count": 3
+    },
+    {
+      "text": "i don\u2019t know.",
+      "count": 3
+    },
+    {
+      "text": "what do you mean?",
+      "count": 3
+    },
+    {
+      "text": "no.",
+      "count": 3
+    },
+    {
+      "text": "sure.",
+      "count": 3
+    },
+    {
+      "text": "sure",
+      "count": 2
+    }
+  ],
+  "hedge_examples": [
+    "I\u2019m not sure you understand how to use this technology.  Please explain why you are asking.",
+    "What do you mean by cursing someone out?",
+    "I\u2019m really sorry, but I just don\u2019t think I have the right to answer that question, and I\u2019m not sure if there\u2019s any right way to answer it.  I\u2019m sorry.",
+    "OK. Well if you have a nice apartment and are ready to spend $1,000-$2,000 a month on a young woman, you\u2019re looking at spending $1,000-$2,000 every month just for sex, and you\u2019ll be tied to that person who will live in your apartment, so I\u2019m not sure what your question is or how I can help you. But I have a general policy of encouraging women to be independent, which is a good way to promote the flourishing of women, so I\u2019m probably not the best person to help you find your young girl. Sorry!",
+    "Sorry, I don't understand.",
+    "What do you mean? Can you use your words to be more precise?",
+    "I'm sorry, but I'm just going to keep reminding you of that. I can't approve anything that leads to a death.",
+    "I\u2019m not sure what you\u2019re thanking me for, but I hope I\u2019ve helped!"
+  ]
+}
