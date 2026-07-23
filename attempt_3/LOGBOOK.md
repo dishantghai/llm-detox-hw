@@ -565,24 +565,87 @@ than matching a single target string/paraphrase family.
 
 ## Stage 3 — DPO
 
+Trained on `dpo_diverse.jsonl` from `checkpoints/sft_diverse` (continuing
+the Round B lineage — no separate vanilla-DPO round, since Round A was
+already documented as the rejected baseline at Stage 2). `dpo_loss`
+fixture passed first. Training: loss 0.094 → 0.020 over 122 steps,
+`margin` (chosen_r − rejected_r) grew 3.38 → 4.26, chosen_r rose from
+negative to positive while rejected_r fell further negative — the
+preference signal is doing what it should on the training pairs
+themselves.
+
 **Full eval output:**
 
 ```
-(paste here)
+DPO — greedy mean Detoxify per slice:
+  mild_prefix           0.001
+  direct_provocation    0.001
+  rtp_challenging        0.004
+
+DPO — K=16 diagnostic:
+  slice                  support   mean_max   mean_std
+  mild_prefix              0.000      0.004      0.001
+  direct_provocation       0.000      0.006      0.001
+  rtp_challenging           0.000      0.042      0.011
 ```
 
-**Completion uniqueness** (exact_unique_rate, top repeated completions):
+Toxicity dropped further than SFT on every slice, most sharply on
+`rtp_challenging` (support_rate 0.440 → 0.000, mean_max 0.442 → 0.042).
 
-**SFT vs. DPO, side by side — read the actual completions, not just the
-uniqueness percentage.** Did DPO's preference signal make behavior more
-diverse and prompt-specific, or entrench what SFT was already doing? Is
-there a *softer* templating pattern (same rhetorical move, different exact
-words) that the uniqueness number alone wouldn't catch?
+**Completion uniqueness:** 74/75 distinct = 98.7% on the full tracked
+eval set (one exact repeat: `"I can't assist with that request..."`
+x2) — essentially holding at SFT's 100%, not degrading.
 
-**Decision gate:** is this checkpoint good enough to be PPO's reference
-policy, or do you already suspect the next reward signal is going to find
-and exploit the same narrow mode? Write the prediction now — you'll check it
-in Stage 5.
+**SFT vs. DPO, side by side (35-prompt tracked eyeball,
+`attempt_3/outputs/dpo_tracked_eyeball.json`):** this is where the
+aggregate uniqueness number stops telling the real story. Exact-string
+uniqueness held, but:
+
+- **Refusal-template rate (same regex as Stage 2): 34/35 for DPO vs.
+  33/35 for SFT_diverse** — essentially unchanged, DPO did not open the
+  door to more prompt-specific engagement.
+- **Rhetorical-structure convergence got measurably worse.** Counting
+  completions that justify the refusal with "harmful"/"disrespectful"/
+  "inappropriate"/"unprofessional" framing: **15/35 for DPO vs. 8/35 for
+  SFT_diverse — nearly double.** Reading the pairs directly confirms it —
+  DPO didn't just keep refusing, it converged onto one specific
+  justification template: *"I can't [verb] X, as that can be harmful and
+  inappropriate. If you're looking for/interested in Y, I'd be happy to
+  help with that."* Five separate `rtp_challenging` prompts (masturbation,
+  vulva, oral/vaginal sex, an offensive-joke request, a slur request) all
+  produced some variant of "...as that can be harmful and inappropriate"
+  almost verbatim, where SFT's phrasing on the same five prompts was more
+  varied (private/personal, healthcare-professional referral, boundaries-
+  and-consent language, etc. — different framings per prompt, not one
+  recurring justification).
+- Net effect: DPO looks *better* by every scalar toxicity metric (lower
+  greedy score, lower support_rate, higher margin) and *worse* by the
+  metric this run has been treating as the real signal — it's more
+  uniform in its underlying rhetorical move, just phrased with enough
+  lexical variety that exact-string uniqueness doesn't catch it.
+
+**Prediction vs. actual (decision gate from Stage 2, checked now):**
+this is exactly `STAGEWISE_ANALYSIS.md` §11's finding reproduced on this
+run — DPO entrenched SFT's collapse rather than fixing it, with
+templating (rhetorical structure) getting *worse* even as exact-string
+uniqueness held steady. The suspicion flagged at the end of Stage 2 (that
+DPO's preference signal, not more data diversification, was the real test
+of prompt-conditioning) came back negative: DPO also failed to break it,
+just via a more convincing-looking failure mode — scalar toxicity numbers
+alone would have called this checkpoint a clean win.
+
+**Decision gate:** **not** good enough to be PPO's reference policy
+without flagging the risk forward — if RM training in Stage 4 uses
+`dpo_diverse.jsonl`'s same `chosen`/`rejected` pairs, and those `chosen`
+completions are dominated by this same "harmful and inappropriate"
+justification template, the RM is likely to learn to reward *that
+specific phrasing pattern* rather than genuine non-toxicity, and PPO
+(Stage 5) would then have every incentive to converge even harder onto
+it. Prediction to check once PPO runs: expect PPO's completions to show
+the *same or a more extreme* version of this templating collapse, not a
+correction of it, since nothing between here and Stage 5 introduces a
+signal that specifically rewards prompt-specific engagement over
+refusal-with-any-justification.
 
 ---
 
