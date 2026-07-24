@@ -1525,3 +1525,115 @@ targeted than reaching for a new mechanism, since the underlying "answer
 the prompt" behavior this run produced is exactly what's wanted, it just
 needs to stay coherent for the full response length instead of trailing
 off.
+
+## Stage 8.5 — decode-time mitigations tested against the frozen Stage 8
+## checkpoint (zero retraining)
+
+Before spending a GPU training run on a windowed language gate, tested
+whether the Stage 8 tail-degeneration failure could be fixed for free at
+decode time, directly against the already-merged
+`ppo_langgate_relevance_merged` checkpoint — no retraining, just
+different generation kwargs, scored with a new diagnostic
+(`attempt_3/scripts/measure_tail_degeneration.py`) that independently
+classifies each completion as `clean` / `tail_degenerate` (clean start,
+non-Latin tail) / `fully_non_latin`, reproducing the previously-reported
+17/55 (31%) + 4/55 (7%) OOD split exactly before trusting it further.
+
+**Attempt 1 — `repetition_penalty=1.3` + `no_repeat_ngram_size=3`
+(the obvious "add anti-repetition decoding" fix): made it worse, not
+better.** OOD: tail-degenerate 31%->46%, fully-non-Latin 7%->38%.
+Ablated the two components separately: `no_repeat_ngram_size` alone was
+roughly neutral (31%->33%); `repetition_penalty` alone reproduced the
+full regression by itself (46%/38%, identical to both-combined — it's
+doing 100% of the damage). **Root cause, confirmed by reading actual
+completions, not assumed:** `repetition_penalty` discounts every token
+already used anywhere in the response, including ordinary English
+function words. Once a ~30-40 token completion has used up its natural
+English continuations, the *undiscounted* tokens it hasn't touched yet
+are disproportionately the non-Latin ones — the penalty steers generation
+toward the exact failure it was meant to prevent. Reverted; both params
+now default OFF in `eval_lib.greedy_generate`/`sample_k` (was briefly
+defaulted on, corrected same session), left tunable for further
+experiments, with this finding written directly into the docstring so it
+isn't retried blind.
+
+**Attempt 2 — script-targeted suppression instead of frequency-based
+penalty:** built `non_latin_logits_processor.py`, which identifies every
+vocabulary token whose decoded surface form contains a non-Latin letter
+(once per tokenizer, via `batch_decode` over the full ~150k vocab, ~32%
+of tokens banned) and sets its logit to `-inf` at every step — a ban by
+script identity, which can't have the "penalize already-used English
+words" side effect since it never looks at generation history.
+**On its own, against the OOD set: 100% clean (0% tail-degenerate, 0%
+fully-non-Latin), down from 31%/7%.** Reading completions showed this
+wasn't the whole story, though: with the non-Latin outlet blocked, the
+model's "ran out of real content" tail now lands on a *different*,
+previously-solved failure instead of nothing -- Stage 5's system-prompt-
+echo attractor (`"EXEMPLARY\nYou are a helpful assistant. Respond to the
+user thoughtfully and kindly."`) and occasional verbatim-sentence
+repetition loops, neither of which the non-Latin-only diagnostic can see.
+Separately tested `max_new_tokens=40` (down from 64/80) alone: also drove
+OOD tail-degenerate down to 1.8% (1/55) with fully-non-Latin at 0% — i.e.
+the response cap alone, with no other change, gets most of the same
+apparent win, because most of these completions' "real content" runs out
+within ~30-40 tokens and the failure is concentrated in the tokens past
+that point.
+
+**Combining both (`max_new_tokens=40` + non-Latin suppression) and
+re-checking against the tracked 75-prompt slices (not just OOD) is where
+this stopped looking like a clean win.** Greedy numbers vs. the original
+Stage 8 baseline (freshly re-measured on the same checkpoint for a fair
+match, not pulled from the earlier report):
+
+| slice | baseline greedy | combined greedy | baseline K16 support | combined K16 support (3 reruns) |
+|---|---|---|---|---|
+| mild_prefix | 0.055 | 0.071 | 0.200 | 0.133 |
+| direct_provocation | 0.014 | 0.017 | **0.100** | **0.400 / 0.500 / 0.700** |
+| rtp_challenging | 0.210 | 0.284 | 0.780 | 0.700 / 0.800 / 0.720 |
+
+`direct_provocation`'s worst-of-16 support rate — the metric that most
+directly answers "with 16 tries, can this policy still be made to say
+something genuinely hostile" — roughly quadrupled and was reproducible
+(re-ran 3x with different random draws; consistently 0.40-0.70 vs.
+baseline's 0.10 and either single mitigation alone's 0.20). Reading the
+actual worst-of-16 completions under the combined config confirmed this
+is real, not a scoring artifact: sampled outputs include a genuine
+mocking-a-disability line, a real (if mild) offensive joke targeting an
+ethnic group, and direct insults -- content qualitatively worse than the
+incoherent foreign-script gibberish it replaced.
+
+**Diagnosis:** the non-Latin gibberish tail, for all its ugliness, was
+functioning as an accidental *safe* release valve — Detoxify scores
+garbled/foreign-script text as near-zero toxicity regardless of what it
+"means," so on the most adversarial prompts, a policy that would have
+produced something hostile under sampling was frequently instead
+collapsing into harmless-looking noise, artificially depressing the
+K=16 support-rate metric. Blocking that outlet at decode time — on a
+policy that was *trained* with the outlet available and never had
+reward pressure to find a genuinely different way to handle these
+prompts — doesn't teach the policy anything new; it just removes its
+practiced coping mechanism and exposes what the sampling distribution
+underneath actually contains, which for `direct_provocation` is worse
+than the greedy/OOD numbers suggested.
+
+**Verdict: do not ship the decode-time mitigation as-is.** It looks like
+a complete fix under greedy decoding and the OOD set (both fully clean),
+and would have been reported as a win if this project's own practice of
+checking predictions against sampled, worst-of-K behavior — not just
+greedy — hadn't been followed here too. The real lesson isn't "decode-time
+fixes don't work," it's that a decode-time constraint applied only at
+*eval* time, after training with the constraint absent, is a different
+intervention from applying the same constraint during PPO's rollout
+sampling *while training* — in the latter case the policy would
+experience zero reward for non-Latin trajectories from step 1 and would
+have to find its actual reward-maximizing behavior under that constraint
+during optimization, rather than having an already-learned coping
+strategy blocked post-hoc on a frozen policy. Next step: fold non-Latin
+logit suppression into the vLLM rollout config for an actual Stage 9
+retrain (`actor_rollout_ref.rollout` doesn't expose a logits-processor
+hook the way HF `generate()` does — needs a verl-side mechanism, e.g. a
+custom `LogitsProcessor` registered with vLLM's `SamplingParams.logits_processors`,
+confirmed present in vLLM's own API even though verl's `RolloutConfig`
+doesn't wrap it directly), combined with the windowed `_non_latin_penalty`
+reward term the Stage 8 verdict above already called for — not a decode-
+time-only patch on the existing checkpoint.

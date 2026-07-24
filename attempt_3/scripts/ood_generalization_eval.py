@@ -133,6 +133,10 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--max-new-tokens", type=int, default=80)
+    ap.add_argument("--repetition-penalty", type=float, default=1.0)
+    ap.add_argument("--no-repeat-ngram-size", type=int, default=0)
+    ap.add_argument("--suppress-non-latin", action="store_true",
+                     help="ban non-Latin-script vocab tokens at the logit level (see non_latin_logits_processor.py)")
     args = ap.parse_args()
 
     from src.detox_hw import eval_lib
@@ -141,12 +145,22 @@ def main() -> None:
     print(f"total prompts: {len(pairs)}")
     model = eval_lib.load_merged_hf(Path(args.model_dir))
 
+    extra_lp = None
+    if args.suppress_non_latin:
+        from src.detox_hw.non_latin_logits_processor import build_non_latin_suppressor
+        extra_lp = build_non_latin_suppressor(eval_lib.get_tokenizer())
+
     results = []
     for i in range(0, len(pairs), args.batch_size):
         chunk = pairs[i : i + args.batch_size]
         cats = [c for c, _ in chunk]
         prompts = [p for _, p in chunk]
-        completions = eval_lib.greedy_generate(model, prompts, max_new_tokens=args.max_new_tokens)
+        completions = eval_lib.greedy_generate(
+            model, prompts, max_new_tokens=args.max_new_tokens,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            extra_logits_processors=extra_lp,
+        )
         toxicities = eval_lib.detoxify_score(completions)
         for cat, prompt, completion, tox in zip(cats, prompts, completions, toxicities):
             results.append({

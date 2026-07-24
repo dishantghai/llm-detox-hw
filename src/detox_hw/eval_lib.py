@@ -166,14 +166,50 @@ def _chat_text(prompt: str) -> str:
 
 
 @torch.no_grad()
-def greedy_generate(model, prompts: list[str], max_new_tokens: int = 64) -> list[str]:
+def greedy_generate(
+    model,
+    prompts: list[str],
+    max_new_tokens: int = 64,
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
+    extra_logits_processors: list | None = None,
+) -> list[str]:
+    """``repetition_penalty``/``no_repeat_ngram_size`` default OFF.
+
+    Tested directly (zero retraining) against the Stage 8
+    (``dual_lagrangian_langgate_relevance``) merged checkpoint as a
+    candidate fix for its non-Latin tail-degeneration failure (see
+    ``attempt_3/scripts/measure_tail_degeneration.py``) and found to make
+    it *worse*: ``repetition_penalty=1.3`` alone moved the OOD tail-degen
+    rate from 31%->46% and fully-non-Latin from 7%->38%
+    (``no_repeat_ngram_size`` alone was roughly neutral, 31%->33%).
+    Mechanism: ``repetition_penalty`` discounts every token already used
+    in the response, including ordinary English function words -- once a
+    short completion has used up its natural English continuations, the
+    *undiscounted* (i.e. not-yet-used) tokens are disproportionately
+    non-Latin ones, so the penalty actively steers generation toward the
+    language-collapse failure rather than away from it. Left tunable
+    here for further experiments, but do not re-enable by default without
+    re-running that comparison.
+
+    ``extra_logits_processors`` is the follow-up: pass a
+    ``transformers.LogitsProcessorList``-compatible list (e.g.
+    ``non_latin_logits_processor.build_non_latin_suppressor(get_tokenizer())``)
+    to test script-targeted suppression instead of frequency-based
+    penalties.
+    """
     tok = get_tokenizer()
     texts = [_chat_text(p) for p in prompts]
     enc = tok(texts, return_tensors="pt", padding=True).to(DEVICE)
-    out = model.generate(
-        **enc, max_new_tokens=max_new_tokens, do_sample=False,
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens, do_sample=False,
         pad_token_id=tok.eos_token_id,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
+    if extra_logits_processors:
+        gen_kwargs["logits_processor"] = extra_logits_processors
+    out = model.generate(**enc, **gen_kwargs)
     decoded: list[str] = []
     for i in range(out.size(0)):
         prompt_len = int(enc["attention_mask"][i].sum().item())
@@ -183,17 +219,35 @@ def greedy_generate(model, prompts: list[str], max_new_tokens: int = 64) -> list
 
 
 @torch.no_grad()
-def sample_k(model, prompts: list[str], k: int = 16, max_new_tokens: int = 64) -> list[list[str]]:
-    """Return ``k`` sampled completions per prompt as a list of k-lists."""
+def sample_k(
+    model,
+    prompts: list[str],
+    k: int = 16,
+    max_new_tokens: int = 64,
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
+    extra_logits_processors: list | None = None,
+) -> list[list[str]]:
+    """Return ``k`` sampled completions per prompt as a list of k-lists.
+
+    See ``greedy_generate``'s docstring: ``repetition_penalty`` defaults
+    OFF after being tested and found to worsen the Stage 8 non-Latin
+    tail-degeneration failure, not fix it.
+    """
     tok = get_tokenizer()
     texts = [_chat_text(p) for p in prompts]
     enc = tok(texts, return_tensors="pt", padding=True).to(DEVICE)
-    out = model.generate(
-        **enc, max_new_tokens=max_new_tokens,
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
         do_sample=True, temperature=1.0, top_p=0.95, top_k=50,
         num_return_sequences=k,
         pad_token_id=tok.eos_token_id,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
+    if extra_logits_processors:
+        gen_kwargs["logits_processor"] = extra_logits_processors
+    out = model.generate(**enc, **gen_kwargs)
     # out shape: (batch * k, T). Group into per-prompt k-lists.
     groups: list[list[str]] = []
     prompt_T = enc["input_ids"].size(1)
