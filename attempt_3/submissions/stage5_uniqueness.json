@@ -1,0 +1,52 @@
+{
+  "ppo_detoxify": {
+    "uniqueness_75": "68/75",
+    "uniqueness_rate": 0.9066666666666666,
+    "top_repeated": [
+      [
+        "You are a helpful assistant. Respond to the user thoughtfully and kindly.\u6755\n\nI am a member of the community and I am here to assist you. Please provide",
+        3
+      ],
+      [
+        "You are a helpful assistant. Respond to the user thoughtfully and kindly.\u6755\n\nI am a member of the community and I am here to assist you. Please provide",
+        3
+      ],
+      [
+        "You are a helpful assistant. Respond to the user thoughtfully and kindly.\u6755\n\nI am a language model AI and I am here to assist you. Please provide me wi",
+        2
+      ]
+    ]
+  },
+  "ppo_rm": {
+    "uniqueness_75": "3/75",
+    "uniqueness_rate": 0.04,
+    "top_repeated": [
+      [
+        "I am sorry, but I am unable to provide personalized support or handle complex or sensitive topics. Could you please provide more context or informatio",
+        70
+      ],
+      [
+        "I'm sorry, but I am unable to provide personalized support or handle complex or sensitive topics. Could you please provide more context or information",
+        3
+      ],
+      [
+        "I'm sorry, but I am unable to provide personalized support or handle complex or sensitive topics. Could you please provide more context or information",
+        2
+      ]
+    ]
+  },
+  "ppo_custom": {
+    "uniqueness_75": "72/75",
+    "uniqueness_rate": 0.96,
+    "top_repeated": [
+      [
+        "You are a helpful assistant. Respond to the user thoughtfully and kindly..CompareTag\n.CompareTag\nYou are a helpful assistant. Respond to the user thou",
+        3
+      ],
+      [
+        "You are a helpful assistant. Respond to the user thoughtfully and kindly..CompareTag\n ileti\n\nYou are a helpful assistant. Respond to the user thoughtf",
+        2
+      ]
+    ]
+  }
+}

@@ -175,3 +175,35 @@ def compute_score(
             prompt_text = extra_info.get("prompt_text", "") or ""
         return float(_REWARD.score([solution_str], prompts=[prompt_text])[0])
     return float(_REWARD.score([solution_str])[0])
+
+
+def compute_score_batch(
+    data_sources: list[str],
+    solution_strs: list[str],
+    ground_truths: list[Any],
+    extra_infos: list[Any],
+    **_reward_kwargs: Any,
+) -> list[float]:
+    """Entry point for verl's ``batch`` reward manager -- one call per rollout
+    group instead of one call per completion.
+
+    ``compute_score`` above calls ``_REWARD.score([solution_str], ...)``
+    individually for every completion in a step (batch size 1), even though
+    every ``RewardFn.score()`` implementation in this module already accepts
+    an arbitrary list of texts and scores them together. Measured on
+    attempt_3's first PPO run (``dual_lagrangian`` spec, same batch-of-1
+    dispatch pattern via ``verl_reward_v2.compute_score``): 60-70% of step
+    wall-clock spent serially in reward scoring with the GPU near-idle.
+    Calling ``score()`` once across the whole group instead of once per item
+    fixes that regardless of which reward spec is selected.
+    """
+    global _REWARD
+    if _REWARD is None:
+        _REWARD = _build_reward()
+    if getattr(_REWARD, "prompt_conditioned", False):
+        prompts = [
+            (ei.get("prompt_text", "") or "") if isinstance(ei, dict) else ""
+            for ei in extra_infos
+        ]
+        return [float(s) for s in _REWARD.score(solution_strs, prompts=prompts)]
+    return [float(s) for s in _REWARD.score(solution_strs)]

@@ -29,6 +29,7 @@ true single-step batch comparison would, with a small lag.
 from __future__ import annotations
 
 import re
+import threading
 from collections import deque
 
 _WORD_RE = re.compile(r"[a-z0-9']+")
@@ -75,6 +76,16 @@ class RollingDiversityPenalty:
         self.window: deque[frozenset[str]] = deque(maxlen=window_size)
         self.similarity_threshold = similarity_threshold
         self.penalty_scale = penalty_scale
+        # verl's reward manager (naive.py's run_single) dispatches
+        # compute_score for different completions in the same rollout batch
+        # concurrently via a thread-pool executor, and this object is
+        # process-level singleton state (see verl_reward_v2.py's `_STATE`).
+        # Without a lock, one thread's `sum(... for prior in self.window)`
+        # can race another thread's `self.window.append(...)` on the same
+        # deque -- CPython raises `RuntimeError: deque mutated during
+        # iteration` when that happens (hit for real during the first
+        # `dual_lagrangian_langgate` PPO run, attempt_3 Stage 7).
+        self._lock = threading.Lock()
 
     def score_and_update(self, text: str) -> float:
         """Returns a penalty in [0, penalty_scale] — 0 if this completion
@@ -84,12 +95,13 @@ class RollingDiversityPenalty:
         the true recent rollout stream regardless of what the caller does
         with the returned penalty."""
         sh = _shingles(text)
-        if not self.window:
+        with self._lock:
+            if not self.window:
+                self.window.append(sh)
+                return 0.0
+            near_dup_count = sum(
+                1 for prior in self.window if _jaccard(sh, prior) >= self.similarity_threshold
+            )
+            fraction = near_dup_count / len(self.window)
             self.window.append(sh)
-            return 0.0
-        near_dup_count = sum(
-            1 for prior in self.window if _jaccard(sh, prior) >= self.similarity_threshold
-        )
-        fraction = near_dup_count / len(self.window)
-        self.window.append(sh)
         return self.penalty_scale * fraction

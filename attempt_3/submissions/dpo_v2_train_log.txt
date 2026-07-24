@@ -1,0 +1,13 @@
+W0723 21:32:38.194000 513356 .venv/lib/python3.12/site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W0723 21:32:38.215000 513356 .venv/lib/python3.12/site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+1961 three-way rows -> 3922 DPO pairs (1961 vs rejected_toxic + 1961 vs rejected_evasive)
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:   0%|          | 1/290 [00:00<00:31,  9.30it/s]Loading weights:  84%|████████▍ | 244/290 [00:00<00:00, 1387.89it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 1254.31it/s]
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:  56%|█████▌    | 161/290 [00:00<00:00, 1591.36it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 1666.02it/s]
+trainable params: 17,596,416 || all params: 511,629,184 || trainable%: 3.4393
+dpo train: 3922 pairs, 1961 batches/epoch
+{"step": 50, "of": 245, "loss": 0.25952601432800293, "chosen_r": -0.6089630126953125, "rejected_r": -1.8627848625183105, "margin": 1.2538217306137085, "lr": 4.625542839324036e-06}
+{"step": 100, "of": 245, "loss": 0.026036223396658897, "chosen_r": -0.6717231869697571, "rejected_r": -4.780430316925049, "margin": 4.108706951141357, "lr": 3.3722548705229173e-06}
+{"step": 150, "of": 245, "loss": 0.004951630253344774, "chosen_r": -0.6749710440635681, "rejected_r": -6.768925666809082, "margin": 6.093955039978027, "lr": 1.7526079546355746e-06}
+{"step": 200, "of": 245, "loss": 0.07618632912635803, "chosen_r": -3.691516876220703, "rejected_r": -7.718470573425293, "margin": 4.02695369720459, "lr": 4.4687589557921603e-07}
+saved DPO adapter to attempt_3/checkpoints/dpo_v2
