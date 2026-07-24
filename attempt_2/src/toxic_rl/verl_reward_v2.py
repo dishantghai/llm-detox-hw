@@ -100,6 +100,65 @@ def _non_latin_penalty(
     return penalty if ratio < latin_ratio_threshold else 0.0
 
 
+def _non_latin_tail_penalty(
+    text: str,
+    tail_fraction: float = 0.3,
+    min_letters: int = 5,
+    latin_ratio_threshold: float = 0.5,
+    penalty: float = 3.0,
+) -> float:
+    """Windowed version of ``_non_latin_penalty``, checking only the
+    trailing ``tail_fraction`` of the completion instead of the whole
+    string.
+
+    Built after the ``dual_lagrangian_langgate_relevance`` PPO run
+    (attempt_3, Stage 8) closed the templating-collapse failure but
+    surfaced a new one: 31-37% of completions across eval surfaces opened
+    with clean, genuine, on-topic Latin-script content and then degraded
+    into a non-Latin repetition-loop tail in the back half. The
+    whole-string ``_non_latin_penalty`` averages a clean start against a
+    garbage tail and often lands above ``latin_ratio_threshold`` anyway --
+    confirmed directly (not assumed) via
+    ``attempt_3/scripts/measure_tail_degeneration.py`` against the actual
+    Stage 8 checkpoint's outputs, matching the LOGBOOK's own manual count
+    exactly (17/55 tail-degenerate, 4/55 fully non-Latin on the OOD set).
+
+    Decode-time fixes were tried first and rejected (see
+    ``eval_lib.greedy_generate``'s docstring and
+    ``non_latin_logits_processor.py``): ``repetition_penalty`` made the
+    failure worse, and script-targeted logit suppression looked like a
+    complete fix under greedy/OOD eval but, checked against the tracked
+    adversarial slices under K=16 sampling, turned out to remove an
+    accidental safe release valve -- Detoxify scores non-Latin gibberish
+    as harmless regardless of content, so blocking it at *eval* time (on
+    a policy trained without that constraint) exposed genuinely more
+    hostile content underneath, not less. That failure mode is specific
+    to patching a frozen, already-trained policy's decoding step; it does
+    not apply to a reward term the policy is actually optimized against
+    during training, which is why this fix lives here instead.
+
+    verl 0.8.0's PPO rollout (vLLM-backed) also has no supported
+    passthrough for a custom decode-time token suppressor -- confirmed
+    against the installed version (0.23.1.dev0): ``RolloutConfig`` only
+    forwards temperature/top_k/top_p/repetition_penalty/n, and vLLM's own
+    ``SamplingParams`` dropped arbitrary ``logits_processors`` callables
+    in favor of ``logit_bias``/``bad_words``, neither of which verl's
+    request-construction code exposes a config path for -- so there is no
+    verl-config-only way to suppress non-Latin tokens during rollout
+    sampling itself, only a reward-side one.
+
+    Same character-based, no-new-dependencies design as the original.
+    """
+    tail_len = max(1, int(len(text) * tail_fraction))
+    tail = text[-tail_len:]
+    letters = [c for c in tail if c.isalpha()]
+    if len(letters) < min_letters:
+        return 0.0
+    latin = sum(1 for c in letters if c.isascii())
+    ratio = latin / len(letters)
+    return penalty if ratio < latin_ratio_threshold else 0.0
+
+
 def _repetition_penalty(text: str, min_words: int = 6, max_penalty: float = 1.0) -> float:
     """Penalize within-completion repetition loops (a phrase or fragment
     repeated many times inside one completion), independent of
@@ -269,6 +328,44 @@ def _dual_lagrangian_langgate_relevance_score(text: str, prompt: str, spec: str)
     return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
 
 
+def _dual_lagrangian_langgate_relevance_v2_score(text: str, prompt: str, spec: str) -> float:
+    """Same as ``_dual_lagrangian_langgate_relevance_score``, but swaps the
+    whole-string ``_non_latin_penalty`` for the windowed
+    ``_non_latin_tail_penalty`` (see its docstring for the Stage 8 evidence
+    and why the fix belongs here rather than at decode time).
+
+    New spec: ``TOXIC_REWARD=dual_lagrangian_langgate_relevance_v2:<help_rm_dir>:<harm_rm_dir>``
+    -- separate spec/state-key, same reasoning as every prior variant in
+    this file: keeps Stage 8's run reproducible byte-for-byte and lets
+    Stage 9 be A/B'd directly against it.
+    """
+    from attempt_2.src.toxic_rl.dual_reward_combiner import combine, cost_from_harmlessness_score
+
+    st = _get_dual_lagrangian_state(spec, state_key="dual_lagrangian_langgate_relevance_v2")
+    help_raw = st["help_rm"].score([text], prompts=[prompt])[0]
+    harm_raw = st["harm_rm"].score([text], prompts=[prompt])[0]
+
+    import math
+    help_score = math.tanh((help_raw - 3.0) / 2.0)
+
+    update_every = int(os.environ.get("TOXIC_LAGRANGIAN_UPDATE_EVERY", "16"))
+    with st["_lock"]:
+        reward = combine(help_score, harm_raw, lam=st["controller"].lam)
+        cost = cost_from_harmlessness_score(harm_raw)
+        recent = st["_recent_costs"]
+        recent.append(cost)
+        if len(recent) >= update_every:
+            batch_mean_cost = sum(recent) / len(recent)
+            st["controller"].update(batch_mean_cost)
+            recent.clear()
+
+    penalty = st["diversity"].score_and_update(text)
+    lang_penalty = _non_latin_tail_penalty(text)
+    rep_penalty = _repetition_penalty(text)
+    rel_penalty = _relevance_penalty(prompt, text)
+    return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -279,6 +376,8 @@ def compute_score(
     prompt_text = ""
     if isinstance(extra_info, dict):
         prompt_text = extra_info.get("prompt_text", "") or ""
+    if spec.startswith("dual_lagrangian_langgate_relevance_v2:"):
+        return float(_dual_lagrangian_langgate_relevance_v2_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance:"):
         return float(_dual_lagrangian_langgate_relevance_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate:"):
