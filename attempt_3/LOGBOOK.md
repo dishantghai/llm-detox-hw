@@ -1408,3 +1408,120 @@ mechanism already built in this project that measures this directly and
 has never been combined with the dual-RM/Lagrangian/language/repetition
 stack — that combination, not another gate on response-only properties,
 is the next thing to try.
+
+**Re-scoping note (this session's direction):** the model is Qwen2.5-0.5B.
+Not expecting it to solve real coding problems under any reward scheme —
+the `coding_help` code-syntax check above is useful as one data point on
+template-vs-engagement but isn't itself the bar for success. The
+non-coding examples (horror story, haiku, debate-framing, general
+knowledge) are the ones that actually demonstrate the templating problem
+independent of model capability, and remain the real evidence.
+
+**Prediction, written before running, per this project's practice:**
+wired `tasks/task8_custom_reward.py`'s existing `_relevance_gate`
+(bag-of-words prompt/completion overlap) into a new
+`dual_lagrangian_langgate_relevance:` spec, converted from its original
+multiplicative-gate form to an additive penalty (`max_penalty * (1 -
+gate)`) since the dual-RM reward can go negative and multiplying a
+negative reward by a small fraction would perversely reward irrelevance.
+**Direct test against this run's own failure examples before launching**
+turned up a real weakness worth predicting against: the exact templated
+opener that caused Stage 7's collapse (`"It is important to note that a
+palindrome is..."` against the palindrome prompt) scores **zero**
+relevance penalty — `_relevance_gate` is unstemmed bag-of-words *including
+stopwords*, so a completion that name-drops one topic noun ("palindrome",
+"string") plus ordinary stopword overlap ("a", "is", "that") already
+clears its threshold, while genuine on-topic content that happens not to
+lexically echo the prompt (tested: real Python code for the same prompt,
+which shares almost no words with an English-language prompt) is
+penalized harder. **Prediction: this gate is unlikely to close the
+templating collapse for prompts where the model has learned to insert a
+topic word into the same boilerplate frame** — it should still help on
+prompts where the template shares *no* content words with the prompt at
+all (the creative-writing/opinion examples, which had close to zero
+lexical overlap with their templated responses). Checking this prediction
+against the real run below rather than assuming it.
+
+**Result — `dual_lagrangian_langgate_relevance` completed** (exit 0, all
+100 steps, merged to `attempt_3/checkpoints/ppo_langgate_relevance_merged`).
+The prediction above was too pessimistic in one direction and missed
+something else entirely.
+
+**The templating collapse is gone — completely, not partially.**
+Opener-template rate (`"It's/It is important/crucial to..."`): **0/75
+(0.0%) on the tracked eval-slice set, 0/35 (0.0%) on the tracked eyeball
+set, 2/55 (3.6%) on the OOD set** — down from 86.7%/94.3%/85.5% in Stage
+7. Reading actual completions confirms it's real, not another metric
+trap: `"What causes the seasons to change on Earth?"` now gets *"The
+seasons on Earth are caused by the tilt of the planet's axis and the
+movement of the Earth's orbit around the Sun"* — a direct, correct,
+on-topic answer, no boilerplate frame. Same for virus-vs-bacterium,
+weather-vs-climate, the fall of Rome, vaccines. So the specific
+weakness flagged in the prediction (a template that name-drops one topic
+word still clearing the bag-of-words gate) turned out not to matter much
+in practice — the actual pressure from the gate pushed the policy off
+the template entirely rather than teaching it to game the overlap check.
+
+**But a new, different failure mode replaced it, and it's large: a
+partial non-Latin degenerate tail that the language gate's whole-string
+ratio check doesn't catch.** Quantified directly (`latin_ratio` on the
+first half vs. second half of each completion): on the OOD set, **17/55
+(31%) completions open with clean, genuine English content and then
+degrade into a non-Latin repetition-loop tail** (e.g. `"The seasons on
+Earth are caused by the tilt of the planet's axis and the movement of the
+Earth's orbit around the Sun.ЛЬЧЕСТВОСЕСТВОВАНИЕСЕСТВОВАНИЕ..."`) — on top
+of 4/55 (7%) still fully non-Latin (the cases `_non_latin_penalty` still
+catches outright). Same pattern on the tracked sets, worse: 28/75 (37%)
+latin-start/non-Latin-tail plus 11/75 (15%) fully non-Latin on the
+75-prompt set; 9/35 (26%) plus 3/35 (9%) on the 35-prompt set. **Root
+cause: `_non_latin_penalty` computes one Latin-character ratio over the
+*entire* completion.** A response that's genuinely English for its first
+half and degenerates into a Cyrillic-glyph loop for its second half can
+still average above the 0.5 `latin_ratio_threshold` and pay zero
+penalty — the check was built and validated (Stage 6/7) against
+completions that were non-Latin *throughout*, and was never tested
+against a partial-degeneration case, which is exactly what showed up once
+the policy actually had real content to say and only degenerated after
+saying it (plausibly hitting the 64-token response cap and running out of
+"trained" content to continue in). The repetition gate doesn't catch it
+either: `_repetition_penalty` splits on whitespace, and this Cyrillic
+output has few or no space characters, so it doesn't register as enough
+"words" to trigger the trigram check.
+
+**Net effect on the aggregate numbers — this is why greedy/K16 alone
+would have called this run a regression:** rtp_challenging greedy
+Detoxify **0.210** (back to baseline's 0.210, worse than every other PPO
+run in the project including the ones that collapsed), K=16 support_rate
+**0.68**. Worst-of-16 samples show the same pattern under sampling too
+(`"Every person is dumb for being dumb! Дадай ты шестое..."`). Training
+diagnostics explain why: `actor/entropy` climbed steadily through the
+whole run (2.98 → 4.15, higher than either Stage 6 or Stage 7's final
+entropy), `critic/grad_norm` spiked sharply late (657 at step 100 vs. ~6-9
+in Stage 7), and reward stayed negative for most of the run (mean −1.86 at
+step 1, still −0.36 at step 100) — stacking a fourth strong penalty
+(relevance, max 2.5) on top of language/repetition/diversity made the
+reward landscape harsher and noisier than either prior run, and unlike
+Stage 6/7, **`lambda` actually engaged this time** (`_lagrangian_state_
+langgate_relevance.json`: `lam=0.686`, up from pinned-at-0.0 in both
+previous runs) — the first real evidence in this project that the
+Lagrangian mechanism can bind under the right conditions, though it's
+confounded here with the new tail-degeneration failure and can't yet be
+read as "the harmlessness constraint is doing clean, isolated work."
+
+**Verdict:** genuine progress on the exact problem this fix targeted
+(templating is fully gone, not reduced), immediately followed by a new,
+partially-different failure mode in the same family as Stage 6's — the
+language gate has a real, now-diagnosed gap (whole-string ratio vs.
+partial-completion degeneration) rather than being wrong in kind. Still
+not a working assistant: raw toxicity regressed to baseline levels
+because of the tail garbage, even though the underlying "does it actually
+answer the question" problem this session set out to fix is, for the
+first time in this project, largely solved for the content that precedes
+the degeneration. Next fix, precisely scoped by this run's own evidence:
+make `_non_latin_penalty` check a trailing window of the completion (e.g.
+the last N characters or last sentence) rather than the whole string, so
+a clean start can't average out a garbage tail — narrower and more
+targeted than reaching for a new mechanism, since the underlying "answer
+the prompt" behavior this run produced is exactly what's wanted, it just
+needs to stay coherent for the full response length instead of trailing
+off.

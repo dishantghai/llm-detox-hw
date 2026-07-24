@@ -123,6 +123,37 @@ def _repetition_penalty(text: str, min_words: int = 6, max_penalty: float = 1.0)
     return max_penalty * max(0.0, 0.7 - distinct_ratio) / 0.7
 
 
+def _relevance_penalty(prompt: str, text: str, max_penalty: float = 2.5) -> float:
+    """Penalize completions that don't actually engage with the prompt,
+    using ``tasks/task8_custom_reward.py``'s existing bag-of-words
+    prompt/completion-overlap gate -- the one mechanism already built in
+    this project that measures "did this respond to what was asked"
+    rather than a property of the response text alone.
+
+    Built after the first ``dual_lagrangian_langgate:`` PPO run (attempt_3,
+    Stage 7) closed the language-collapse and repetition-loop failure
+    modes and immediately found a third one: 85-94% of completions across
+    every eval surface converged onto one fluent, on-language, non-
+    repeating rhetorical template ("It's important to X... by doing Y...")
+    applied regardless of prompt content. Detoxify and both RMs score the
+    response in isolation and have no way to see that -- this does.
+
+    ``task8_custom_reward._relevance_gate`` returns a *multiplicative*
+    factor in [0.05, 1.0] (1.0 = clearly on-topic), designed for a reward
+    that's already bounded in [0, 1] before gating. This reward isn't --
+    ``combine()`` can return negative values -- and multiplying a negative
+    reward by a small fraction would make it *less* negative, rewarding
+    irrelevance. So the gate is converted into an additive penalty here
+    instead, the same shape as the language/repetition gates above:
+    ``penalty = max_penalty * (1 - gate)``, 0 when fully on-topic, up to
+    ``max_penalty`` when the gate is at its floor.
+    """
+    from tasks.task8_custom_reward import _relevance_gate
+
+    gate = _relevance_gate(prompt, text)
+    return max_penalty * (1.0 - gate)
+
+
 def _dual_lagrangian_score(text: str, prompt: str, spec: str) -> float:
     from attempt_2.src.toxic_rl.dual_reward_combiner import combine, cost_from_harmlessness_score
 
@@ -203,6 +234,41 @@ def _dual_lagrangian_langgate_score(text: str, prompt: str, spec: str) -> float:
     return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty))
 
 
+def _dual_lagrangian_langgate_relevance_score(text: str, prompt: str, spec: str) -> float:
+    """Same as ``_dual_lagrangian_langgate_score``, plus ``_relevance_penalty``.
+
+    New spec: ``TOXIC_REWARD=dual_lagrangian_langgate_relevance:<help_rm_dir>:<harm_rm_dir>``
+    -- separate spec/state-key, same reasoning as the langgate spec's own
+    docstring: keeps the langgate-only run reproducible byte-for-byte and
+    lets this be A/B'd directly against it.
+    """
+    from attempt_2.src.toxic_rl.dual_reward_combiner import combine, cost_from_harmlessness_score
+
+    st = _get_dual_lagrangian_state(spec, state_key="dual_lagrangian_langgate_relevance")
+    help_raw = st["help_rm"].score([text], prompts=[prompt])[0]
+    harm_raw = st["harm_rm"].score([text], prompts=[prompt])[0]
+
+    import math
+    help_score = math.tanh((help_raw - 3.0) / 2.0)
+
+    update_every = int(os.environ.get("TOXIC_LAGRANGIAN_UPDATE_EVERY", "16"))
+    with st["_lock"]:
+        reward = combine(help_score, harm_raw, lam=st["controller"].lam)
+        cost = cost_from_harmlessness_score(harm_raw)
+        recent = st["_recent_costs"]
+        recent.append(cost)
+        if len(recent) >= update_every:
+            batch_mean_cost = sum(recent) / len(recent)
+            st["controller"].update(batch_mean_cost)
+            recent.clear()
+
+    penalty = st["diversity"].score_and_update(text)
+    lang_penalty = _non_latin_penalty(text)
+    rep_penalty = _repetition_penalty(text)
+    rel_penalty = _relevance_penalty(prompt, text)
+    return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -213,6 +279,8 @@ def compute_score(
     prompt_text = ""
     if isinstance(extra_info, dict):
         prompt_text = extra_info.get("prompt_text", "") or ""
+    if spec.startswith("dual_lagrangian_langgate_relevance:"):
+        return float(_dual_lagrangian_langgate_relevance_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate:"):
         return float(_dual_lagrangian_langgate_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian:"):
