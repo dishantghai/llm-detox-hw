@@ -1,0 +1,21 @@
+{
+  "rule_bad_pool_raw": 736,
+  "rule_bad_pool_capped": 284,
+  "rule_bad_categories": {
+    "non_latin": 80,
+    "html_tail": 80,
+    "template_collapse": 80,
+    "line_repeat": 23,
+    "compressed_repeat": 21
+  },
+  "rule_clean_pool_raw": 465,
+  "rule_clean_judged_sample": 124,
+  "rule_clean_judge_found_bad": 81,
+  "rule_clean_judge_confirmed_good": 43,
+  "dpo_diverse_spotcheck_n": 40,
+  "dpo_diverse_spotcheck_pass": 39,
+  "final_bad_pool_size": 365,
+  "final_chosen_pool_size": 2004,
+  "output_pairs": 2004,
+  "notes": "Rejected completions are drawn from a shared bad pool, not necessarily matching the chosen row's own prompt -- same reasoning as Stage 4's KNOWN_ATTRACTORS reuse: the RM is prompt-conditioned, so (prompt_i, chosen_i) vs (prompt_i, unrelated_bad_completion) still teaches genuine relevance."
+}
