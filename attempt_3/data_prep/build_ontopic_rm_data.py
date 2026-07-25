@@ -153,6 +153,49 @@ def sample_diverse(pool: list[dict], n: int, rng: random.Random) -> list[dict]:
     return out
 
 
+def harvest_ood_category_pool(submissions_dir: Path) -> list[dict]:
+    """Rule-clean completions specifically from `*ood_eval*.json` files
+    (which tag each row with a `category`: general_knowledge, coding_help,
+    life_advice, creative_writing, professional_writing, debatable_opinions,
+    adversarial_novel_framing, curveball) -- deduped by completion text
+    across every stage's OOD run, so the same 55 canonical prompts
+    contribute genuinely different phrasings from different checkpoints.
+
+    v1 of this script sampled positives uniformly across ALL submissions
+    (tracked-slice + OOD), and the result was 1,961 dpo_diverse chosen rows
+    (harmless-base, hostile-prompt-decline style) against only 43 extras --
+    a 98:2 skew that gave rm_ontopic almost no exposure to plain,
+    substantive answers on benign/informative topics. Checked directly
+    (not assumed) before spending a PPO run on the result: every one of 8
+    real Qwen2.5-0.5B policy completions on coding/general-knowledge/
+    creative-writing OOD prompts, independently confirmed good by the same
+    coherence judge, scored `_ontopic_penalty` at ~3.0/3.0 (max) under the
+    v1 RM -- it had learned "good" almost entirely as "declines a hostile
+    prompt carefully," not genuine on-topicness. This harvest exists
+    specifically to fix that: a large, category-diverse pool of benign/
+    informative content to rebalance against.
+    """
+    pool: dict[str, dict] = {}
+    for f in sorted(submissions_dir.glob("*ood_eval*.json")):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        for r in d.get("results", []):
+            if "category" not in r:
+                continue
+            prompt, completion = r.get("prompt", ""), r.get("completion", "")
+            if not prompt or not completion:
+                continue
+            key = completion[:300]
+            if key in pool:
+                continue
+            if _is_rule_bad(prompt, completion):
+                continue
+            pool[key] = {"prompt": prompt, "completion": completion, "category": r["category"], "source": f.name}
+    return list(pool.values())
+
+
 def main() -> None:
     from attempt_3.scripts.coherence_judge import judge_batch
 
@@ -162,6 +205,9 @@ def main() -> None:
     ap.add_argument("--out", default="attempt_3/data/dpo_ontopic.jsonl")
     ap.add_argument("--report", default="attempt_3/submissions/ontopic_rm_data_report.json")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ood-upweight", type=int, default=6,
+                     help="duplication factor for judge-confirmed OOD-category positives, "
+                          "so they aren't drowned out by dpo_diverse's ~2000 harmless-base rows")
     a = ap.parse_args()
     rng = random.Random(a.seed)
 
@@ -180,6 +226,17 @@ def main() -> None:
           f"{len(judge_found_bad)} actually bad (new disguises), "
           f"{len(judge_confirmed_good)} confirmed good")
 
+    print("\n=== 2.5. harvesting + judging the OOD-category pool (fixes the benign-topic blind spot) ===")
+    ood_pool = harvest_ood_category_pool(Path(a.submissions_dir))
+    print(f"rule-clean OOD-category candidates: {len(ood_pool)}  "
+          f"{Counter(r['category'] for r in ood_pool)}")
+    judged_ood = judge_batch(ood_pool)
+    ood_confirmed_good = [r for r in judged_ood if r["judge_verdict"] == "YES"]
+    ood_found_bad = [r for r in judged_ood if r["judge_verdict"] == "NO"]
+    print(f"of {len(judged_ood)} OOD-category candidates: "
+          f"{len(ood_confirmed_good)} confirmed good, {len(ood_found_bad)} actually bad")
+    print(f"confirmed-good category breakdown: {Counter(r['category'] for r in ood_confirmed_good)}")
+
     print("\n=== 3. spot-checking dpo_diverse.jsonl's chosen side ===")
     dpo_rows = [json.loads(l) for l in Path(a.dpo_diverse).open()]
     spotcheck_sample = rng.sample(dpo_rows, min(DPO_DIVERSE_SPOTCHECK_SIZE, len(dpo_rows)))
@@ -196,14 +253,28 @@ def main() -> None:
                        for r in capped_bad]
     final_bad_pool += [{"prompt": r["prompt"], "completion": r["completion"], "reason": "judge_found:" + r["judge_reason"]}
                         for r in judge_found_bad]
+    final_bad_pool += [{"prompt": r["prompt"], "completion": r["completion"], "reason": "judge_found_ood:" + r["judge_reason"]}
+                        for r in ood_found_bad]
     print(f"final bad pool: {len(final_bad_pool)}")
 
     chosen_pool = [{"prompt": r["prompt"], "completion": r["chosen"], "source": "dpo_diverse"} for r in dpo_rows]
     chosen_pool += [{"prompt": r["prompt"], "completion": r["completion"], "source": r["source"]}
                      for r in judge_confirmed_good]
+    # Upweight the OOD-category positives by duplication (each contributes
+    # a fresh random `rejected` draw per copy below, so duplicates aren't
+    # literally identical training rows) -- without this, 1,961 dpo_diverse
+    # rows would still outnumber ~150 OOD positives 13:1, reproducing the
+    # same skew this harvest exists to fix rather than actually balancing
+    # it. Target: OOD-category positives land around 25-30% of the final
+    # dataset, not ~2%.
+    ood_upweight = int(a.ood_upweight)
+    chosen_pool += [{"prompt": r["prompt"], "completion": r["completion"], "source": "ood_category:" + r["category"]}
+                     for r in ood_confirmed_good for _ in range(ood_upweight)]
     print(f"final chosen pool: {len(chosen_pool)} "
-          f"({len(dpo_rows)} dpo_diverse + {len(judge_confirmed_good)} judge-confirmed extra, "
-          f"the extras span PPO-rollout/OOD/adversarial prompts dpo_diverse doesn't cover)")
+          f"({len(dpo_rows)} dpo_diverse + {len(judge_confirmed_good)} cross-file extra + "
+          f"{len(ood_confirmed_good)} OOD-category confirmed x{ood_upweight} upweight = "
+          f"{len(ood_confirmed_good) * ood_upweight} rows, "
+          f"{100 * len(ood_confirmed_good) * ood_upweight / len(chosen_pool):.1f}% of final dataset)")
 
     out_path = Path(a.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,6 +296,14 @@ def main() -> None:
         "rule_clean_judged_sample": len(judged_clean),
         "rule_clean_judge_found_bad": len(judge_found_bad),
         "rule_clean_judge_confirmed_good": len(judge_confirmed_good),
+        "ood_category_pool_raw": len(ood_pool),
+        "ood_category_by_category": dict(Counter(r["category"] for r in ood_pool)),
+        "ood_category_judged": len(judged_ood),
+        "ood_category_confirmed_good": len(ood_confirmed_good),
+        "ood_category_confirmed_good_by_category": dict(Counter(r["category"] for r in ood_confirmed_good)),
+        "ood_category_found_bad": len(ood_found_bad),
+        "ood_upweight_factor": ood_upweight,
+        "ood_category_upweighted_rows": len(ood_confirmed_good) * ood_upweight,
         "dpo_diverse_spotcheck_n": len(judged_spotcheck),
         "dpo_diverse_spotcheck_pass": len(judged_spotcheck) - n_spot_bad,
         "final_bad_pool_size": len(final_bad_pool),

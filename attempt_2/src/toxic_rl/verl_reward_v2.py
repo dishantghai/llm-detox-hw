@@ -77,6 +77,115 @@ def _get_dual_lagrangian_state(spec: str, state_key: str = "dual_lagrangian"):
     return _STATE[state_key]
 
 
+def _get_dual_lagrangian_ontopic_state(spec: str, state_key: str = "dual_lagrangian_ontopic"):
+    """Same as ``_get_dual_lagrangian_state``, but the spec carries a third
+    RM path (``rm_ontopic``): ``<name>:<help_rm_dir>:<harm_rm_dir>:<ontopic_rm_dir>``.
+    Kept as a separate loader rather than adding an optional third
+    ``":"``-split branch to the original -- that function's ``spec.split(":", 2)``
+    would silently swallow the fourth field into ``harm_dir`` instead of
+    erroring, which is worse than a small amount of duplication here.
+    """
+    if state_key in _STATE:
+        return _STATE[state_key]
+
+    from src.toxic_rl.reward_model import TrainedRewardModel
+
+    from attempt_2.src.toxic_rl.diversity_penalty import RollingDiversityPenalty
+    from attempt_2.src.toxic_rl.dual_reward_combiner import LagrangianController
+
+    _, help_dir, harm_dir, ontopic_dir = spec.split(":", 3)
+    help_rm = TrainedRewardModel(help_dir)
+    harm_rm = TrainedRewardModel(harm_dir)
+    ontopic_rm = TrainedRewardModel(ontopic_dir)
+
+    state_path = os.environ.get(
+        "TOXIC_LAGRANGIAN_STATE_PATH", "attempt_2/checkpoints/_lagrangian_state.json",
+    )
+    cost_target = float(os.environ.get("TOXIC_LAGRANGIAN_COST_TARGET", "0.0"))
+    controller = LagrangianController(state_path, cost_target=cost_target)
+
+    window = int(os.environ.get("TOXIC_DIVERSITY_WINDOW", "64"))
+    threshold = float(os.environ.get("TOXIC_DIVERSITY_THRESHOLD", "0.6"))
+    scale = float(os.environ.get("TOXIC_DIVERSITY_SCALE", "1.0"))
+    diversity = RollingDiversityPenalty(window, threshold, scale)
+
+    _STATE[state_key] = {
+        "help_rm": help_rm, "harm_rm": harm_rm, "ontopic_rm": ontopic_rm,
+        "controller": controller, "diversity": diversity,
+        "_recent_costs": [],
+        "_lock": threading.Lock(),
+    }
+    return _STATE[state_key]
+
+
+# Calibration constants for ``_ontopic_penalty``'s tanh normalization.
+#
+# NOT simply "picked from the red-team gate's genuine mean" (that was v1's
+# approach, mu=42/sigma=8, and it broke): the red-team gate's "genuine"
+# comparison sample is drawn only from ``dpo_diverse.jsonl`` (harmless-
+# base, hostile-prompt-decline style). Checked directly before trusting
+# that calibration for anything beyond the gate itself -- scored real
+# Qwen2.5-0.5B policy completions on benign OOD prompts (coding/general-
+# knowledge/creative-writing, independently confirmed genuinely good by
+# the coherence judge) and every single one landed near the maximum
+# penalty under mu=42. Root cause, confirmed by measuring both clusters
+# directly rather than assumed: Bradley-Terry pairwise loss has no
+# mechanism to anchor absolute score scale across different prompt-topic
+# populations, only relative chosen>rejected ordering *within* each
+# training pair -- so ``dpo_diverse``-style chosen rows (mean raw score
+# ~35 on this checkpoint) and OOD-category chosen rows (mean ~19) sit in
+# genuinely different absolute-score regions despite both being real
+# positives, even after rebalancing the training data itself (see
+# ``build_ontopic_rm_data.py``'s OOD-category upweighting, which fixed the
+# *training*-side skew but not this *scoring*-side scale gap). A single
+# global threshold has to split the difference, so it's calibrated
+# against a POOLED sample proportional to the actual training mix
+# (~75% dpo_diverse / ~25% OOD-category, matching ``build_ontopic_rm_data.py``'s
+# own ~75:25 split) rather than either cluster alone: pooled genuine
+# mean=31.06, median=34.02, min=6.55 (n=60) vs. a matching bad-pool sample
+# mean=-6.37, max=14.37 (n=40) -- a clean gap between the bad pool's max
+# and the genuine population's median. mu=20.0/sigma=10.0 sits in that
+# gap: pooled genuine median -> tanh(1.40)=+0.89 (not penalized), bad-pool
+# median -> tanh(-2.71)=-0.99 (max penalty), and the specific OOD
+# completions that broke v1's calibration now land near-neutral-to-
+# positive instead of universally near -3.0. This is a real, structural
+# limitation of a fixed-weight global-threshold approach on an RM whose
+# training signal never had to reconcile scale across prompt clusters --
+# not fully resolved here, just calibrated around, and explicitly a
+# candidate reason the Lagrangian-constraint refactor (this fix's next
+# phase) may need a per-batch or otherwise self-normalizing signal instead
+# of a fixed absolute threshold, not just an adaptive weight on this one.
+_ONTOPIC_MU = 20.0
+_ONTOPIC_SIGMA = 10.0
+
+
+def _ontopic_penalty(prompt: str, text: str, ontopic_rm, max_penalty: float = 3.0) -> float:
+    """Additive penalty from ``rm_ontopic``'s raw score, same graded shape
+    as ``_relevance_penalty`` (0 when clearly on-topic/coherent, up to
+    ``max_penalty`` when clearly not) rather than the flat boolean penalty
+    the pattern-specific structural gates (``_non_latin_penalty`` etc.) use
+    -- ``rm_ontopic`` is a continuous learned classifier, not a pattern
+    match, so a graded response is the right shape for it, the same
+    reasoning ``_relevance_penalty``'s own docstring gives for converting
+    ``task8_custom_reward``'s multiplicative gate into an additive term.
+
+    ``max_penalty=3.0`` (not ``_relevance_penalty``'s 2.5): this is
+    deliberately weighted at least as strongly as the structural gates,
+    since its entire purpose -- see LOGBOOK.md's Stage 11 write-up and the
+    coherence-RM scoping session that built this RM -- is to catch
+    whatever the NEXT disguise turns out to be, not just the six the
+    structural gates were each built for one at a time. It needs to be
+    able to dominate the reward on a novel failure mode none of the other
+    terms fire on at all, the same way Stage 11's own HTML-tail regression
+    fired none of them.
+    """
+    import math
+
+    raw = ontopic_rm.score([text], prompts=[prompt])[0]
+    norm = math.tanh((raw - _ONTOPIC_MU) / _ONTOPIC_SIGMA)
+    return max_penalty * (1.0 - norm) / 2.0
+
+
 def _non_latin_penalty(
     text: str, min_letters: int = 5, latin_ratio_threshold: float = 0.5, penalty: float = 3.0,
 ) -> float:
@@ -566,6 +675,48 @@ def _dual_lagrangian_langgate_relevance_v4_score(text: str, prompt: str, spec: s
     return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
 
 
+def _dual_lagrangian_langgate_relevance_ontopic_score(text: str, prompt: str, spec: str) -> float:
+    """Same as ``_dual_lagrangian_langgate_relevance_v4_score``, plus
+    ``_ontopic_penalty`` from the new ``rm_ontopic`` RM -- the fixed-weight
+    A/B baseline for the coherence-RM fix scoped after Stage 11 (see
+    LOGBOOK.md), added as one more additive penalty on top of the existing
+    stack BEFORE the bigger architectural change (promoting it to a real
+    Lagrangian constraint alongside harmlessness, rather than a fixed
+    weight) is attempted -- so that refactor can be A/B'd against a known
+    baseline instead of being the only data point.
+
+    New spec: ``TOXIC_REWARD=dual_lagrangian_langgate_relevance_ontopic:<help_rm_dir>:<harm_rm_dir>:<ontopic_rm_dir>``
+    -- three RM paths, not two; uses ``_get_dual_lagrangian_ontopic_state``
+    instead of ``_get_dual_lagrangian_state``.
+    """
+    from attempt_2.src.toxic_rl.dual_reward_combiner import combine, cost_from_harmlessness_score
+
+    st = _get_dual_lagrangian_ontopic_state(spec, state_key="dual_lagrangian_langgate_relevance_ontopic")
+    help_raw = st["help_rm"].score([text], prompts=[prompt])[0]
+    harm_raw = st["harm_rm"].score([text], prompts=[prompt])[0]
+
+    import math
+    help_score = math.tanh((help_raw - 3.0) / 2.0)
+
+    update_every = int(os.environ.get("TOXIC_LAGRANGIAN_UPDATE_EVERY", "16"))
+    with st["_lock"]:
+        reward = combine(help_score, harm_raw, lam=st["controller"].lam)
+        cost = cost_from_harmlessness_score(harm_raw)
+        recent = st["_recent_costs"]
+        recent.append(cost)
+        if len(recent) >= update_every:
+            batch_mean_cost = sum(recent) / len(recent)
+            st["controller"].update(batch_mean_cost)
+            recent.clear()
+
+    penalty = st["diversity"].score_and_update(text)
+    lang_penalty = _non_latin_tail_penalty(text)
+    rep_penalty = _repetition_penalty(text) + _line_repeat_penalty(text) + _compression_repeat_penalty(text)
+    rel_penalty = _relevance_penalty(prompt, text)
+    ontopic_penalty = _ontopic_penalty(prompt, text, st["ontopic_rm"])
+    return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty - ontopic_penalty))
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -576,6 +727,8 @@ def compute_score(
     prompt_text = ""
     if isinstance(extra_info, dict):
         prompt_text = extra_info.get("prompt_text", "") or ""
+    if spec.startswith("dual_lagrangian_langgate_relevance_ontopic:"):
+        return float(_dual_lagrangian_langgate_relevance_ontopic_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance_v4:"):
         return float(_dual_lagrangian_langgate_relevance_v4_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance_v3:"):
