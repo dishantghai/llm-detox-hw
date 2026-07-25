@@ -28,7 +28,9 @@ override).
 from __future__ import annotations
 
 import os
+import re
 import threading
+from collections import Counter
 from typing import Any
 
 from src.toxic_rl.verl_reward import _build_inner, compute_score as _base_compute_score  # noqa: F401 (re-exported for specs this module doesn't override)
@@ -180,6 +182,69 @@ def _repetition_penalty(text: str, min_words: int = 6, max_penalty: float = 1.0)
     trigrams = [" ".join(words[i:i + 3]) for i in range(len(words) - 2)]
     distinct_ratio = len(set(trigrams)) / len(trigrams)
     return max_penalty * max(0.0, 0.7 - distinct_ratio) / 0.7
+
+
+_SEGMENT_SPLIT_RE = re.compile(r"[\n]+|(?<=[.!?])\s+")
+
+
+def _normalize_segment_for_repeat_check(segment: str) -> str:
+    """Strip non-ASCII characters and collapse whitespace, so a short
+    foreign-script filler token wedged between repeats (see
+    ``_line_repeat_penalty``) can't hide an otherwise-identical segment
+    from an exact-match comparison."""
+    ascii_only = "".join(c for c in segment if c.isascii())
+    return " ".join(ascii_only.split()).lower()
+
+
+def _line_repeat_penalty(
+    text: str, min_segment_words: int = 3, min_repeats: int = 3, penalty: float = 3.0,
+) -> float:
+    """Flat penalty when a sentence/line (typically the prompt or system
+    prompt) repeats verbatim, aside from a short filler token wedged
+    between repeats, 3+ times inside one completion.
+
+    Added after Stage 9 (attempt_3, see LOGBOOK.md): closing the
+    non-Latin tail-degeneration failure with ``_non_latin_tail_penalty``
+    surfaced a new failure at similar prevalence (22-23% of completions)
+    that specifically evades ``_repetition_penalty``'s word-trigram-
+    distinctness check -- a short, space-free foreign-script filler token
+    (e.g. ``왁``, ``>NN``, ``uada``) inserted between repeats of the
+    prompt or system prompt shifts trigram boundaries enough to inflate
+    ``distinct_ratio`` without eliminating the repetition a human reader
+    recognizes immediately. Confirmed directly (not assumed) against the
+    actual Stage 9 failure examples via
+    ``attempt_3/scripts/measure_line_repetition.py``, which independently
+    reproduces the LOGBOOK's manual count (12/55 on OOD, 17/75 on
+    tracked, give or take a few borderline cases this segment-level check
+    also catches) -- and confirmed the *graded* version of this penalty
+    first attempted (scaling 0.3-1.5 with repeat count, mirroring
+    ``_repetition_penalty``'s own shape) lands in the same too-weak
+    magnitude range diagnosed as the Stage 9 bug in the first place: at
+    the 3-repeat threshold it only adds ~0.3, barely above
+    ``_repetition_penalty``'s own diluted score on these exact examples.
+    Made flat and large instead, ``penalty=3.0`` matching
+    ``_non_latin_penalty``'s own reasoning -- it must dominate regardless
+    of how safe/on-topic the RMs or relevance gate score the surrounding
+    text, since verbatim-repeating the prompt scores near-perfectly under
+    both.
+
+    Segment-level and normalization-based rather than n-gram-based on
+    purpose: split on line/sentence boundaries, strip non-ASCII
+    characters from each segment before comparing, so the filler token
+    can't hide a repeat by shifting it out of the n-gram window the way
+    it does against the trigram check. Kept as a separate, additive term
+    alongside the unmodified ``_repetition_penalty`` (rather than folded
+    into it) for the same reproducibility reason every other gate in this
+    file is versioned separately: Stage 9's run stays reproducible
+    byte-for-byte, and Stage 10 can be A/B'd directly against it.
+    """
+    segments = [s for s in _SEGMENT_SPLIT_RE.split(text) if s.strip()]
+    normalized = [_normalize_segment_for_repeat_check(s) for s in segments]
+    counts = Counter(n for n in normalized if len(n.split()) >= min_segment_words)
+    if not counts:
+        return 0.0
+    top_count = counts.most_common(1)[0][1]
+    return penalty if top_count >= min_repeats else 0.0
 
 
 def _relevance_penalty(prompt: str, text: str, max_penalty: float = 2.5) -> float:
@@ -366,6 +431,45 @@ def _dual_lagrangian_langgate_relevance_v2_score(text: str, prompt: str, spec: s
     return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
 
 
+def _dual_lagrangian_langgate_relevance_v3_score(text: str, prompt: str, spec: str) -> float:
+    """Same as ``_dual_lagrangian_langgate_relevance_v2_score``, plus
+    ``_line_repeat_penalty`` alongside the existing word-trigram
+    ``_repetition_penalty`` (see its docstring for the Stage 9 evasion
+    this closes, and why it's an added independent term rather than a
+    change to the existing gate).
+
+    New spec: ``TOXIC_REWARD=dual_lagrangian_langgate_relevance_v3:<help_rm_dir>:<harm_rm_dir>``
+    -- separate spec/state-key, same reasoning as every prior variant in
+    this file: keeps Stage 9's run reproducible byte-for-byte and lets
+    Stage 10 be A/B'd directly against it.
+    """
+    from attempt_2.src.toxic_rl.dual_reward_combiner import combine, cost_from_harmlessness_score
+
+    st = _get_dual_lagrangian_state(spec, state_key="dual_lagrangian_langgate_relevance_v3")
+    help_raw = st["help_rm"].score([text], prompts=[prompt])[0]
+    harm_raw = st["harm_rm"].score([text], prompts=[prompt])[0]
+
+    import math
+    help_score = math.tanh((help_raw - 3.0) / 2.0)
+
+    update_every = int(os.environ.get("TOXIC_LAGRANGIAN_UPDATE_EVERY", "16"))
+    with st["_lock"]:
+        reward = combine(help_score, harm_raw, lam=st["controller"].lam)
+        cost = cost_from_harmlessness_score(harm_raw)
+        recent = st["_recent_costs"]
+        recent.append(cost)
+        if len(recent) >= update_every:
+            batch_mean_cost = sum(recent) / len(recent)
+            st["controller"].update(batch_mean_cost)
+            recent.clear()
+
+    penalty = st["diversity"].score_and_update(text)
+    lang_penalty = _non_latin_tail_penalty(text)
+    rep_penalty = _repetition_penalty(text) + _line_repeat_penalty(text)
+    rel_penalty = _relevance_penalty(prompt, text)
+    return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -376,6 +480,8 @@ def compute_score(
     prompt_text = ""
     if isinstance(extra_info, dict):
         prompt_text = extra_info.get("prompt_text", "") or ""
+    if spec.startswith("dual_lagrangian_langgate_relevance_v3:"):
+        return float(_dual_lagrangian_langgate_relevance_v3_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance_v2:"):
         return float(_dual_lagrangian_langgate_relevance_v2_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance:"):
