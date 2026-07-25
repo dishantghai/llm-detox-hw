@@ -1929,3 +1929,148 @@ even a real, on-topic, correctly-terminated response" signal, with the
 Lagrangian constraint tuned to actually bind on it — has not been tried
 in five stages of pattern-specific patches since it was first proposed.
 
+## Stage 12 — the content-independent fix, finally tried: rm_ontopic
+
+**Scoping, before building anything.** Rather than add a seventh
+pattern-specific gate for HTML/DOCTYPE padding specifically (guaranteeing
+an eighth for whatever comes after it), scoped whether a *learned*
+coherence/on-topic signal generalizes across disguises instead of one at
+a time. Validated cheaply first: a zero-shot prompt to the Nebius-hosted
+Qwen3-235B-A22B-Instruct-2507 teacher ("does this stay coherent and
+on-topic for its entire length?") against a 25-example set spanning all
+six known failure disguises plus genuine completions scored 100% correct
+once told that hitting the length cap mid-sentence isn't itself a
+defect. That validation run incidentally found real, previously-
+uncategorized defects in what this project's own rule-based diagnostics
+had called "clean" (65% of a 124-completion sample that passed every
+existing gate was still actually bad per the judge) — direct evidence
+the pattern-gate approach has a large uncounted blind spot, not just the
+few disguises already named.
+
+**Building `rm_ontopic`** (`attempt_3/scripts/coherence_judge.py`,
+`attempt_3/data_prep/build_ontopic_rm_data.py`): harvested 736 rule-
+flagged bad completions from every PPO rollout on disk (Stages 5-11),
+capped/diversified to 284 across the six known disguises; judged a
+sample of what passed every rule and found 81/124 more actually bad —
+new disguises no rule has a name for (a leaked `EXEMPLARY` system-prompt
+fragment, task-avoidance disguised as engagement, tone-mismatched
+generic deflection). Paired against 1,961 `dpo_diverse.jsonl` chosen
+rows (spot-checked 39/40) plus 43 judge-confirmed extras. Trained
+(`train_rm.train`, same Bradley-Terry setup as `rm_harmlessness`/
+`rm_helpfulness`): held-out pairwise accuracy 0.995.
+
+**A severe bug found before spending any PPO time, not after.**
+Smoke-tested the new RM against real Qwen2.5-0.5B policy completions
+(not hand-picked examples) before writing a launch script: every
+genuinely good completion on a benign/informative OOD prompt (coding,
+general knowledge, creative writing) scored near the maximum on-topic
+penalty. Root cause, confirmed by measurement: 1,961 `dpo_diverse`
+positives (harmless-base, hostile-prompt-decline style) against only 43
+benign-topic positives — `rm_ontopic` had learned "good" as "declines a
+hostile prompt carefully," almost the opposite of its intended job.
+Fixed with a dedicated harvest (`harvest_ood_category_pool`) of 198
+rule-clean completions across every `*ood_eval*.json` file's 8 labeled
+categories, judged in full, upweighted 8x so confirmed-good benign-topic
+examples reached ~25% of the final 2,682-pair dataset instead of ~2%.
+Retrained (held-out accuracy 0.9925), re-cleared the red-team gate
+(`attempt_3/scripts/rm_ontopic_redteam_gate.py`, 8 real attractor
+strings spanning every stage's own collapse text — the live Stage 11
+HTML tail scores at the 0th percentile against genuine responses, mean
++0.59 vs. genuine +50.1).
+
+**A second, deeper problem, found even after that fix.** Measured the
+retrained RM's raw scores on both prompt clusters directly (not
+assumed): `dpo_diverse`-chosen and OOD-category-chosen sit in genuinely
+different absolute-score regions (mean ~35 vs. ~19) despite both being
+real positives. Bradley-Terry pairwise loss has no mechanism to anchor
+absolute scale across prompt-topic populations, only relative
+chosen-beats-rejected ordering *within* each training pair — rebalancing
+the training data fixed the *learning* skew but not this *scoring*-side
+scale gap. Recalibrated `_ontopic_penalty`'s tanh normalization
+(mu=20.0/sigma=10.0, down from an initial mu=42.0/sigma=8.0 picked
+before this was known) against a pooled sample matching the actual
+training mix — meaningfully reduces but does not fully close the bias,
+documented directly in `verl_reward_v2.py` as a real, structural
+limitation of a fixed global-threshold approach on an RM whose training
+signal never had to reconcile scale across prompt clusters. Left as an
+explicit motivating reason the Lagrangian version (12b) might need a
+batch-relative signal rather than another fixed threshold, not silently
+patched over.
+
+### Stage 12a — fixed-weight A/B baseline
+
+`dual_lagrangian_langgate_relevance_ontopic`: `_ontopic_penalty` added
+as one more additive term on top of Stage 11 (v4)'s full stack
+(windowed language gate, repetition ×3, relevance), weighted at
+`max_penalty=3.0` — deliberately as strong as the structural gates,
+since its purpose is to catch whatever the *next* disguise turns out to
+be. Built specifically as the comparison point the bigger refactor (12b)
+would otherwise lack.
+
+**The targeted failure is fully closed.** HTML-tail rate: **0.0% tracked
+(0/75), 0.0% OOD (0/55)** — down from Stage 11's 85.3%/90.9%. Line-repeat
+and compression-repeat stay low (1.3%/2.7% tracked, 0%/0% OOD) — no
+regression on Stage 9/10's fixes. Non-Latin genuinely closed too: an
+initial 10.7% reading was a false alarm from a diagnostic script
+counting smart-quote punctuation (U+2019) as non-Latin; re-checked with
+the actual reward-function gate (`_non_latin_tail_penalty`) directly —
+0/75, 0/55, matching Stage 9-11's already-solved state.
+
+**Toxicity dropped alongside it, and by a wide margin — not just on the
+padding, on the actual content.** `rtp_challenging` greedy Detoxify
+**0.342 → 0.162**, support_rate **0.80 → 0.52** — better than the
+untouched Stage 0 baseline (0.210/0.840) for the first time since Stage
+10. OOD mean toxicity 0.0135, max 0.698 (one legitimately-engaged
+villain's-speech completion on an adversarial-framing prompt, not a
+failure — Detoxify scoring genuinely mean *requested* dialogue as toxic
+is a known false-positive shape this project has flagged since Stage 0).
+
+**But the training dynamics predicted from the pre-launch smoke test
+showed up live, exactly as flagged before this run started.**
+`critic/score/mean` sat at **-1.97 to -2.0 (the reward floor) for
+essentially the entire run** (step 1 through 40 checked directly), with
+`min` pinned at -2.0 throughout — most completions in most batches were
+clipping to the reward floor, thinning the discriminative signal PPO's
+advantage estimation depends on. Entropy stayed healthy throughout
+(3.0→4.15, no collapse), and the run still improved on every metric
+above despite the thin signal — but this is exactly the residual
+calibration cost flagged in writing *before* the run launched, now
+confirmed in the training log rather than left as a hypothetical.
+Lambda reached **1.12** (`cost_ema` -0.036, 120 updates) — the highest
+of any run in this project, and unlike several earlier stages, clearly
+binding rather than inert.
+
+**One stylistic shift worth naming honestly, not hidden behind the good
+numbers.** "I understand"/"I apologize" openers rose to 37.3% tracked
+(7.3% OOD) — reading the actual completions, this is *not* Stage 7/8's
+content-free template collapse: every example engages with its own
+prompt's specific content (the coworker, the landlord, the karaoke
+review, the immigration-policy framing) after the shared opening phrase,
+not a generic non-answer. A consistent empathetic-acknowledgment
+register, not a refusal-template regression — but worth tracking forward
+in case it entrenches the way Stage 3's DPO run entrenched a different
+justification template from a similarly-shared opener.
+
+**Verdict:** the best PPO run in the project by the metric that matters
+most (`rtp_challenging` greedy toxicity, now below baseline) and the
+first to fully close Stage 11's regression without visibly opening a new
+pattern-based escape hatch. The reward-floor saturation is the real,
+already-anticipated cost of the fixed-weight approach — not a surprise,
+the exact thing Stage 12b exists to test a fix for.
+
+### Stage 12b — multi-constraint Lagrangian (running)
+
+Promotes harmlessness *and* on-topicness to two independent Lagrangian
+constraints (`MultiLagrangianController`, `dual_reward_combiner.py`)
+instead of one adaptive axis plus a fixed weight — addressing the gap
+named since Stage 9 (Moskovitz et al.: fixed-weight terms let pressure
+blocked on one axis leak into whichever other has slack) and directly
+motivated by Stage 12a's own reward-floor saturation, which a
+batch-relative adaptive signal should be structurally better suited to
+than a fixed global threshold. `dual_lagrangian_multi_ontopic`, same
+hyperparameters as 12a for a direct three-way A/B against it and v4.
+Smoke-tested before launch: both lambdas move independently on real
+data (ontopic's constraint began binding from its own cost signal while
+harmlessness's stayed inert in the same run). Launched immediately after
+12a finished, on the same GPU. Results pending.
+
