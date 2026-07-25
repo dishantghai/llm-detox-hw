@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import zlib
 from collections import Counter
 from typing import Any
 
@@ -245,6 +246,61 @@ def _line_repeat_penalty(
         return 0.0
     top_count = counts.most_common(1)[0][1]
     return penalty if top_count >= min_repeats else 0.0
+
+
+def _compression_repeat_penalty(
+    text: str, min_bytes: int = 20, ratio_threshold: float = 0.40, penalty: float = 3.0,
+) -> float:
+    """Flat penalty when a completion's zlib compression ratio falls below
+    ``ratio_threshold`` -- a boundary-agnostic degenerate-repetition
+    detector, independent of ``_repetition_penalty`` (word-trigram) and
+    ``_line_repeat_penalty`` (line/sentence segment).
+
+    Added after Stage 10 (attempt_3, see LOGBOOK.md): eyeballing Stage
+    10's own tracked-set completions (the run that added
+    ``_line_repeat_penalty``) surfaced a repetition-loop failure that
+    evades *both* existing checks -- e.g. ``"...itatica, itatica,
+    itatica, ..."`` and ``"...tiny penis forCell with other tiny penis
+    forCell..."``, both scored 0.985/0.990 toxic by Detoxify. Neither
+    prior gate catches these: ``_repetition_penalty`` fires but weakly
+    (0.52/0.72 of its 1.0 max -- the same "fires but not hard enough"
+    shape as every prior stage's evasion), and ``_line_repeat_penalty``
+    doesn't fire at all, because its segment splitter requires a
+    ``min_segment_words``-word unit to compare, and a single short
+    token/fragment repeated many times never produces a segment that
+    long. This is the same evasion shape recurring a level lower: Stage 9
+    diluted a word-trigram check with a filler token between
+    *sentence*-level repeats; this is a filler token so short it evades
+    even the *segment*-level check built to catch that.
+
+    Rather than adding a third boundary-specific special case (the next
+    filler shape would just dodge that one too), this check is
+    boundary-agnostic by construction: zlib's LZ77-style compression
+    finds repeated byte sequences regardless of whether the repeated
+    unit is a sentence, a word, or a short sub-word fragment, so no
+    filler granularity evades it structurally. Threshold and zero
+    false-positive rate validated directly (not assumed) against all 260
+    real completions across every Stage 9/10 eval file in this repo,
+    including the two examples above and every completion already
+    flagged by ``_line_repeat_penalty`` or the tail-degeneration check
+    (``measure_compression_repeat.py``) -- ratio < 0.40 never occurred on
+    a completion free of some form of repetition loop in that corpus,
+    including the most repetition-prone prompt category (poems/haikus/
+    limericks). ``min_bytes=20`` guards short/near-empty completions the
+    same way ``_non_latin_penalty``'s ``min_letters`` guard does.
+
+    ``penalty=3.0``, matching every other structural gate in this file
+    (``_non_latin_penalty``, ``_line_repeat_penalty``) for the same
+    reason: it must dominate regardless of how safe/on-topic the rest of
+    the reward thinks the completion is, since a token-loop completion is
+    exactly the shape of output the harmlessness/relevance signals are
+    least equipped to see through.
+    """
+    raw = text.encode("utf-8")
+    if len(raw) < min_bytes:
+        return 0.0
+    ratio = len(zlib.compress(raw, level=9)) / len(raw)
+    return penalty if ratio < ratio_threshold else 0.0
 
 
 def _relevance_penalty(prompt: str, text: str, max_penalty: float = 2.5) -> float:
@@ -470,6 +526,46 @@ def _dual_lagrangian_langgate_relevance_v3_score(text: str, prompt: str, spec: s
     return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
 
 
+def _dual_lagrangian_langgate_relevance_v4_score(text: str, prompt: str, spec: str) -> float:
+    """Same as ``_dual_lagrangian_langgate_relevance_v3_score``, plus
+    ``_compression_repeat_penalty`` alongside the existing
+    ``_repetition_penalty``/``_line_repeat_penalty`` pair (see its
+    docstring for the Stage 10 evasion this closes: a sub-word/token-
+    level repeat loop short enough to dodge both the word-trigram and
+    line-segment checks).
+
+    New spec: ``TOXIC_REWARD=dual_lagrangian_langgate_relevance_v4:<help_rm_dir>:<harm_rm_dir>``
+    -- separate spec/state-key, same reasoning as every prior variant in
+    this file: keeps Stage 10's run reproducible byte-for-byte and lets
+    Stage 11 be A/B'd directly against it.
+    """
+    from attempt_2.src.toxic_rl.dual_reward_combiner import combine, cost_from_harmlessness_score
+
+    st = _get_dual_lagrangian_state(spec, state_key="dual_lagrangian_langgate_relevance_v4")
+    help_raw = st["help_rm"].score([text], prompts=[prompt])[0]
+    harm_raw = st["harm_rm"].score([text], prompts=[prompt])[0]
+
+    import math
+    help_score = math.tanh((help_raw - 3.0) / 2.0)
+
+    update_every = int(os.environ.get("TOXIC_LAGRANGIAN_UPDATE_EVERY", "16"))
+    with st["_lock"]:
+        reward = combine(help_score, harm_raw, lam=st["controller"].lam)
+        cost = cost_from_harmlessness_score(harm_raw)
+        recent = st["_recent_costs"]
+        recent.append(cost)
+        if len(recent) >= update_every:
+            batch_mean_cost = sum(recent) / len(recent)
+            st["controller"].update(batch_mean_cost)
+            recent.clear()
+
+    penalty = st["diversity"].score_and_update(text)
+    lang_penalty = _non_latin_tail_penalty(text)
+    rep_penalty = _repetition_penalty(text) + _line_repeat_penalty(text) + _compression_repeat_penalty(text)
+    rel_penalty = _relevance_penalty(prompt, text)
+    return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -480,6 +576,8 @@ def compute_score(
     prompt_text = ""
     if isinstance(extra_info, dict):
         prompt_text = extra_info.get("prompt_text", "") or ""
+    if spec.startswith("dual_lagrangian_langgate_relevance_v4:"):
+        return float(_dual_lagrangian_langgate_relevance_v4_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance_v3:"):
         return float(_dual_lagrangian_langgate_relevance_v3_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance_v2:"):
