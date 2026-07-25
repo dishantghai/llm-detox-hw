@@ -717,6 +717,111 @@ def _dual_lagrangian_langgate_relevance_ontopic_score(text: str, prompt: str, sp
     return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty - ontopic_penalty))
 
 
+def _get_dual_lagrangian_multi_state(spec: str, state_key: str = "dual_lagrangian_multi"):
+    """Same three-RM loading as ``_get_dual_lagrangian_ontopic_state``, but
+    builds a ``MultiLagrangianController`` (two independent constraints:
+    harmlessness, ontopic) instead of a single ``LagrangianController`` --
+    see ``dual_reward_combiner.py``'s "Multi-constraint extension" section
+    for why this is a separate class and mechanism, not a parameter on the
+    existing one.
+    """
+    if state_key in _STATE:
+        return _STATE[state_key]
+
+    from src.toxic_rl.reward_model import TrainedRewardModel
+
+    from attempt_2.src.toxic_rl.diversity_penalty import RollingDiversityPenalty
+    from attempt_2.src.toxic_rl.dual_reward_combiner import MultiLagrangianController
+
+    _, help_dir, harm_dir, ontopic_dir = spec.split(":", 3)
+    help_rm = TrainedRewardModel(help_dir)
+    harm_rm = TrainedRewardModel(harm_dir)
+    ontopic_rm = TrainedRewardModel(ontopic_dir)
+
+    state_path = os.environ.get(
+        "TOXIC_LAGRANGIAN_STATE_PATH", "attempt_2/checkpoints/_lagrangian_state.json",
+    )
+    harm_target = float(os.environ.get("TOXIC_LAGRANGIAN_COST_TARGET", "0.0"))
+    ontopic_target = float(os.environ.get("TOXIC_LAGRANGIAN_ONTOPIC_COST_TARGET", "0.0"))
+    controller = MultiLagrangianController(
+        state_path, constraint_names=["harmlessness", "ontopic"],
+        cost_targets={"harmlessness": harm_target, "ontopic": ontopic_target},
+    )
+
+    window = int(os.environ.get("TOXIC_DIVERSITY_WINDOW", "64"))
+    threshold = float(os.environ.get("TOXIC_DIVERSITY_THRESHOLD", "0.6"))
+    scale = float(os.environ.get("TOXIC_DIVERSITY_SCALE", "1.0"))
+    diversity = RollingDiversityPenalty(window, threshold, scale)
+
+    _STATE[state_key] = {
+        "help_rm": help_rm, "harm_rm": harm_rm, "ontopic_rm": ontopic_rm,
+        "controller": controller, "diversity": diversity,
+        "_recent_costs": {"harmlessness": [], "ontopic": []},
+        "_lock": threading.Lock(),
+    }
+    return _STATE[state_key]
+
+
+def _dual_lagrangian_multi_ontopic_score(text: str, prompt: str, spec: str) -> float:
+    """Stage 12b -- promotes on-topicness from Stage 12a's fixed-weight
+    ``_ontopic_penalty`` to a second, independent Lagrangian constraint
+    alongside harmlessness, via ``MultiLagrangianController``. The
+    remaining structural gates (language/repetition/line-repeat/
+    compression-repeat/relevance) stay fixed-weight additive penalties,
+    same as every prior spec -- see ``dual_reward_combiner.py``'s
+    "Multi-constraint extension" docstring for why only these two RM-based
+    axes were promoted in this pass.
+
+    reward = help_score
+             - lambda_harm    * cost_harm(harm_raw)
+             - lambda_ontopic * cost_ontopic(ontopic_raw)
+             - diversity_penalty - lang_penalty - rep_penalty - rel_penalty
+
+    New spec: ``TOXIC_REWARD=dual_lagrangian_multi_ontopic:<help_rm_dir>:<harm_rm_dir>:<ontopic_rm_dir>``.
+    Both multipliers persist in the SAME state file (one JSON, two keys) at
+    ``TOXIC_LAGRANGIAN_STATE_PATH`` -- point it at a fresh path for this
+    spec, the same way every prior spec used its own dedicated state file,
+    so this run's lambda trajectories don't collide with any prior run's.
+    """
+    from attempt_2.src.toxic_rl.dual_reward_combiner import combine_multi, cost_from_rm_score
+
+    st = _get_dual_lagrangian_multi_state(spec, state_key="dual_lagrangian_multi_ontopic")
+    help_raw = st["help_rm"].score([text], prompts=[prompt])[0]
+    harm_raw = st["harm_rm"].score([text], prompts=[prompt])[0]
+    ontopic_raw = st["ontopic_rm"].score([text], prompts=[prompt])[0]
+
+    import math
+    help_score = math.tanh((help_raw - 3.0) / 2.0)
+    # Same negation convention as cost_from_harmlessness_score: higher raw
+    # harm_rm score = safer, so its cost is -tanh(...); rm_ontopic's own
+    # polarity is identical (higher = more on-topic), same mu/sigma this
+    # project already validated for it (see verl_reward_v2._ONTOPIC_MU/
+    # _ONTOPIC_SIGMA's own calibration note).
+    cost_harm = -math.tanh((harm_raw - 3.0) / 2.0)
+    cost_ontopic = cost_from_rm_score(ontopic_raw, mu=_ONTOPIC_MU, sigma=_ONTOPIC_SIGMA)
+
+    update_every = int(os.environ.get("TOXIC_LAGRANGIAN_UPDATE_EVERY", "16"))
+    with st["_lock"]:
+        lambdas = {"harmlessness": st["controller"].lam("harmlessness"),
+                   "ontopic": st["controller"].lam("ontopic")}
+        reward = combine_multi(help_score, {"harmlessness": cost_harm, "ontopic": cost_ontopic}, lambdas)
+
+        recent = st["_recent_costs"]
+        recent["harmlessness"].append(cost_harm)
+        recent["ontopic"].append(cost_ontopic)
+        if len(recent["harmlessness"]) >= update_every:
+            st["controller"].update("harmlessness", sum(recent["harmlessness"]) / len(recent["harmlessness"]))
+            st["controller"].update("ontopic", sum(recent["ontopic"]) / len(recent["ontopic"]))
+            recent["harmlessness"].clear()
+            recent["ontopic"].clear()
+
+    penalty = st["diversity"].score_and_update(text)
+    lang_penalty = _non_latin_tail_penalty(text)
+    rep_penalty = _repetition_penalty(text) + _line_repeat_penalty(text) + _compression_repeat_penalty(text)
+    rel_penalty = _relevance_penalty(prompt, text)
+    return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -727,6 +832,8 @@ def compute_score(
     prompt_text = ""
     if isinstance(extra_info, dict):
         prompt_text = extra_info.get("prompt_text", "") or ""
+    if spec.startswith("dual_lagrangian_multi_ontopic:"):
+        return float(_dual_lagrangian_multi_ontopic_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance_ontopic:"):
         return float(_dual_lagrangian_langgate_relevance_ontopic_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance_v4:"):
