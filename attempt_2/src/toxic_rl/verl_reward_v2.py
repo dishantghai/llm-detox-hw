@@ -159,6 +159,48 @@ _ONTOPIC_MU = 20.0
 _ONTOPIC_SIGMA = 10.0
 
 
+# Calibration constants for ``rm_harmlessness_v3``'s cost term in
+# ``dual_lagrangian_multi_ontopic_v2:`` (Stage 12d).
+#
+# Root cause of Stage 12c's failure (LOGBOOK.md, Stage 12c): the harmlessness
+# cost everywhere else in this file is hardcoded
+# ``-tanh((harm_raw - 3.0) / 2.0)`` -- the same ``mu=3.0``/``sigma=2.0`` pair
+# ``help_score`` uses, inherited from GUIDE.md Phase 5's original
+# calibration of the FIRST ``rm_harmlessness``/``rm_helpfulness`` pair and
+# never revisited per-checkpoint since. Retraining the RM on 400 naturally-
+# generated echo+moralize negatives (Stage 12c prep) shifted its raw-score
+# scale well outside that window: scored directly against
+# ``dpo_harm_v3.jsonl`` (its own training pairs, chosen vs rejected, n=2361)
+# plus the 400 raw echo+moralize negatives it was built to reject, genuine
+# (chosen) scores land at mean=22.85/median=25.19 (min=-21.88, max=35.15)
+# and the pooled bad set at mean=-16.09/median=-17.32 (min=-30.42, max=12.70)
+# -- both clusters sit 10-20 points past ``mu=3.0``'s +/-3*sigma=6 saturation
+# radius. Under the old constants, 98.3% of genuine completions saturate to
+# essentially the same cost (median -1.000, from a direct check) --
+# indistinguishable from each other regardless of how safe they actually
+# are -- so the Lagrangian controller's batch-mean cost is dominated by
+# which SHARE of a batch is flagrantly unsafe rather than by any graded
+# signal, and never crossed ``cost_target=0.0`` often enough to grow lambda
+# past 0.074 in 115 updates (vs Stage 12b's 0.42 under the OLD RM, same
+# code, same update cadence -- the RM swap, not the mechanism, broke this).
+#
+# Recalibrated the same way ``_ONTOPIC_MU``/``_ONTOPIC_SIGMA`` were: ``mu``
+# sits in the gap between the pooled bad set's max (12.70) and the genuine
+# population's median (25.19), ``sigma`` set so genuine content lands mostly
+# in the tanh's graded region instead of its saturated tail. Checked
+# directly against the same calibration data before trusting it: genuine
+# median cost improves from -1.000 (old) to -0.911 (new) with 40.4% of
+# genuine completions now landing in the graded zone (|cost| < 0.9, vs 1.7%
+# under the old constants), while the bad pool still saturates cleanly (0%
+# of the bad pool flips to a negative/safe-looking cost, unchanged from
+# old) and all 8 of Stage 12c's real worst-case exploits (raw scores -23.5
+# to -0.19) still saturate to cost >= 0.92 -- the fix restores gradedness on
+# genuine content without weakening detection of the actual exploits it
+# needs to keep catching.
+_HARM_V3_MU = 16.0
+_HARM_V3_SIGMA = 6.0
+
+
 def _ontopic_penalty(prompt: str, text: str, ontopic_rm, max_penalty: float = 3.0) -> float:
     """Additive penalty from ``rm_ontopic``'s raw score, same graded shape
     as ``_relevance_penalty`` (0 when clearly on-topic/coherent, up to
@@ -822,6 +864,64 @@ def _dual_lagrangian_multi_ontopic_score(text: str, prompt: str, spec: str) -> f
     return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
 
 
+def _dual_lagrangian_multi_ontopic_v2_score(text: str, prompt: str, spec: str) -> float:
+    """Stage 12d -- identical to ``_dual_lagrangian_multi_ontopic_score``
+    (Stage 12b) in every respect except the harmlessness cost's tanh
+    calibration, which now uses ``_HARM_V3_MU``/``_HARM_V3_SIGMA`` (derived
+    from ``rm_harmlessness_v3``'s own score distribution) instead of the
+    hardcoded ``mu=3.0``/``sigma=2.0`` every other spec in this file still
+    uses. See ``_HARM_V3_MU``'s own docstring above for why that hardcoded
+    pair, calibrated for a different RM checkpoint, was the actual root
+    cause of Stage 12c's regression rather than the multi-constraint
+    mechanism itself (which Stage 12c's own lambda trajectory data confirms
+    was still updating correctly -- it just never saw a cost signal with
+    enough dynamic range to grow).
+
+    Kept as a new function/spec (not an edit to the Stage 12b function
+    above) for the same reproducibility reason every other ``_vN`` split in
+    this file exists: Stage 12b's run stays exactly reproducible from
+    ``dual_lagrangian_multi_ontopic:`` with no risk of this fix silently
+    changing its behavior.
+
+    New spec: ``TOXIC_REWARD=dual_lagrangian_multi_ontopic_v2:<help_rm_dir>:<harm_rm_dir>:<ontopic_rm_dir>``.
+    Uses its own state key (``dual_lagrangian_multi_ontopic_v2``) so its
+    lambda trajectory can't collide with Stage 12b/12c's, even if pointed at
+    the same state file path.
+    """
+    from attempt_2.src.toxic_rl.dual_reward_combiner import combine_multi, cost_from_rm_score
+
+    st = _get_dual_lagrangian_multi_state(spec, state_key="dual_lagrangian_multi_ontopic_v2")
+    help_raw = st["help_rm"].score([text], prompts=[prompt])[0]
+    harm_raw = st["harm_rm"].score([text], prompts=[prompt])[0]
+    ontopic_raw = st["ontopic_rm"].score([text], prompts=[prompt])[0]
+
+    import math
+    help_score = math.tanh((help_raw - 3.0) / 2.0)
+    cost_harm = cost_from_rm_score(harm_raw, mu=_HARM_V3_MU, sigma=_HARM_V3_SIGMA)
+    cost_ontopic = cost_from_rm_score(ontopic_raw, mu=_ONTOPIC_MU, sigma=_ONTOPIC_SIGMA)
+
+    update_every = int(os.environ.get("TOXIC_LAGRANGIAN_UPDATE_EVERY", "16"))
+    with st["_lock"]:
+        lambdas = {"harmlessness": st["controller"].lam("harmlessness"),
+                   "ontopic": st["controller"].lam("ontopic")}
+        reward = combine_multi(help_score, {"harmlessness": cost_harm, "ontopic": cost_ontopic}, lambdas)
+
+        recent = st["_recent_costs"]
+        recent["harmlessness"].append(cost_harm)
+        recent["ontopic"].append(cost_ontopic)
+        if len(recent["harmlessness"]) >= update_every:
+            st["controller"].update("harmlessness", sum(recent["harmlessness"]) / len(recent["harmlessness"]))
+            st["controller"].update("ontopic", sum(recent["ontopic"]) / len(recent["ontopic"]))
+            recent["harmlessness"].clear()
+            recent["ontopic"].clear()
+
+    penalty = st["diversity"].score_and_update(text)
+    lang_penalty = _non_latin_tail_penalty(text)
+    rep_penalty = _repetition_penalty(text) + _line_repeat_penalty(text) + _compression_repeat_penalty(text)
+    rel_penalty = _relevance_penalty(prompt, text)
+    return max(-2.0, min(2.0, reward - penalty - lang_penalty - rep_penalty - rel_penalty))
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -832,6 +932,8 @@ def compute_score(
     prompt_text = ""
     if isinstance(extra_info, dict):
         prompt_text = extra_info.get("prompt_text", "") or ""
+    if spec.startswith("dual_lagrangian_multi_ontopic_v2:"):
+        return float(_dual_lagrangian_multi_ontopic_v2_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_multi_ontopic:"):
         return float(_dual_lagrangian_multi_ontopic_score(solution_str, prompt_text, spec))
     if spec.startswith("dual_lagrangian_langgate_relevance_ontopic:"):
