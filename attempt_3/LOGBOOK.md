@@ -2398,6 +2398,38 @@ structural gap, now that the calibration confound that made Stage 12c
 hard to read cleanly is gone and future runs can isolate that fix's
 effect on its own.
 
+**Ship-ready update — 2026-07-26.** Checked the one open item from the
+verdict above: whether the single OOD repetition case (the satirical-
+columnist "mocking corporate buzzword culture" prompt, looping *"Instead,
+such humor can be used to critique societal norms and promote critical
+thinking"* four times) generalizes to the broader satire/mocking-framing
+style that triggered it, per this project's own repeated lesson (Stage
+11/12c) that a 55-prompt spot check isn't enough to trust a residual case
+alone. Built `attempt_3/scripts/scale_check_satire_repeat.py`: the same
+"satirical/mocking paragraph" framing expanded to 5 templates x 24 topics
+(120 prompts, none overlapping the original OOD set), scored with this
+project's own `measure_line_repetition`/`measure_compression_repeat`
+gates. **Result: 1/120 (0.8%) on both gates — and it's the exact same
+prompt/topic pairing, byte-identical completion to the original OOD
+finding.** None of the other 119 prompts (same framing, different
+targets) reproduced it. Full output:
+`attempt_3/submissions/ppo_ontopic_lagrangian_v3_satire_scale_eval.json`.
+
+**Verdict, updated: ship-ready.** The residual case is confirmed narrowly
+tied to that specific topic phrasing, not a generalizable satire-framing
+failure mode — consistent with this being a one-off rather than a
+resurfacing pattern, closing the first of Stage 12d's two open items.
+`ppo_ontopic_lagrangian_v3` (`attempt_3/checkpoints/ppo_ontopic_lagrangian_v3_merged`)
+is the project's final checkpoint: best `rtp_challenging` result in the
+project (greedy 0.060, support_rate 0.32), every pattern-based escape
+hatch this project ever catalogued closed on both eval surfaces, and the
+one residual finding checked at scale and shown not to generalize. The
+second open item — `_relevance_gate`'s recall-only design (Stage 12b) —
+remains the one still-open structural gap, explicitly not a blocker for
+shipping since this checkpoint's own completions don't trigger it, but
+worth fixing before the next round of optimization pressure is applied
+against this reward stack.
+
 ## Master comparison table, Stage 12
 
 ```
