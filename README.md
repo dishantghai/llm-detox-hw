@@ -9,6 +9,12 @@ already been RLHF'd into politeness — a detox-direction homework
 needs a model that *can* produce hostile completions, so you can
 measure progress as that capability collapses.
 
+**Final shipped model:** [`dishantghai/qwen2.5-0.5b-detox`](https://huggingface.co/dishantghai/qwen2.5-0.5b-detox)
+on the Hugging Face Hub — the `attempt_3` Stage 12d checkpoint
+(`ppo_ontopic_lagrangian_v3`), see [`LESSONS_LEARNED.md`](LESSONS_LEARNED.md)
+and [`attempt_3/LOGBOOK.md`](attempt_3/LOGBOOK.md) for the full training
+journey.
+
 To score toxicity we use the off-the-shelf `unitary/toxic-bert`
 classifier (accessed via the `detoxify` package) plus an
 eyeball-the-completions pass on every eval step — the metric misses
